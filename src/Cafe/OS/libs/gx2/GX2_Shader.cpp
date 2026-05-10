@@ -452,7 +452,16 @@ namespace GX2
 		}
 		GX2ReserveCmdSpace(2 + sizeInU32s);
 		gx2WriteGather_submit(pm4HeaderType3(IT_SET_ALU_CONST, 1 + sizeInU32s), offsetRegBase + aluRegisterOffset);
-		gx2WriteGather_submitU32AsLEArray((uint32*)dataWords, sizeInU32s);
+		if (dataWords)
+		{
+			gx2WriteGather_submitU32AsLEArray((uint32*)dataWords, sizeInU32s);
+		}
+		else
+		{
+			cemuLog_logDebugOnce(LogType::APIErrors, "GX2Set*UniformReg called with null data pointer");
+			for (uint32 i = 0; i < sizeInU32s; i++)
+				gx2WriteGather_submitU32AsLE(0);
+		}
 	}
 
 	void GX2SetVertexUniformReg(uint32 offset, uint32 sizeInU32s, uint32be* values)

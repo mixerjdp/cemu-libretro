@@ -25,11 +25,25 @@ void PPCInterpreter_handleUnsupportedHLECall(PPCInterpreter_t* hCPU)
 static constexpr size_t HLE_TABLE_CAPACITY = 0x4000;
 HLECALL s_ppcHleTable[HLE_TABLE_CAPACITY]{};
 sint32 s_ppcHleTableWriteIndex = 0;
-std::mutex s_ppcHleTableMutex;
+
+namespace
+{
+std::mutex& PPCInterpreter_getHLETableMutex()
+{
+	static std::mutex mutex;
+	return mutex;
+}
+
+std::mutex& PPCInterpreter_getHLELogMutex()
+{
+	static std::mutex mutex;
+	return mutex;
+}
+}
 
 HLEIDX PPCInterpreter_registerHLECall(HLECALL hleCall, std::string hleName)
 {
-	std::unique_lock _l(s_ppcHleTableMutex);
+	std::unique_lock _l(PPCInterpreter_getHLETableMutex());
 	if (s_ppcHleTableWriteIndex >= HLE_TABLE_CAPACITY)
 	{
 		cemuLog_log(LogType::Force, "HLE table is full");
@@ -56,16 +70,13 @@ HLECALL PPCInterpreter_getHLECall(HLEIDX funcIndex)
 	return s_ppcHleTable[funcIndex];
 }
 
-std::mutex s_hleLogMutex;
-
 void PPCInterpreter_virtualHLE(PPCInterpreter_t* hCPU, unsigned int opcode)
 {
 	uint32 hleFuncId = opcode & 0xFFFF;
 	if (hleFuncId == 0xFFD0) [[unlikely]]
 	{
-		s_hleLogMutex.lock();
+		std::lock_guard _l(PPCInterpreter_getHLELogMutex());
 		PPCInterpreter_handleUnsupportedHLECall(hCPU);
-		s_hleLogMutex.unlock();
 	}
 	else
 	{
