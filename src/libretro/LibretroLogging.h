@@ -11,4 +11,5 @@ public:
 };
 
 void libretro_init_logging();
+void libretro_set_verbose_logging(bool enabled);
 void libretro_shutdown_logging();

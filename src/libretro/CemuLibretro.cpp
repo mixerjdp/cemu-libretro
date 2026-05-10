@@ -439,6 +439,20 @@ static struct retro_core_option_v2_definition s_core_options_v2_defs[] = {
 		"disabled"
 	},
 	{
+		"cemu_logging",
+		"Logging",
+		NULL,
+		"Select normal logging for gameplay or verbose logging for debugging.",
+		NULL,
+		"Debug",
+		{
+			{ "normal", "Normal" },
+			{ "verbose", "Verbose (large logs)" },
+			{ NULL, NULL }
+		},
+		"normal"
+	},
+	{
 		"cemu_downscale_filter",
 		"Downscale Filter",
 		NULL,
@@ -639,6 +653,7 @@ static void libretro_register_core_options()
 		{ "cemu_thread_quantum", "Thread Quantum; 45000|20000|60000|80000|100000" },
 		{ "cemu_audio_latency", "Audio Latency; 2|1|3|4" },
 		{ "cemu_vsync", "VSync; disabled|enabled" },
+		{ "cemu_logging", "Logging; normal|verbose" },
 		{ "cemu_render_upside_down", "Render Upside Down; disabled|enabled" },
 		{ "cemu_shader_compile_notification", "Shader Compile Notification; enabled|disabled" },
 		{ "cemu_emulate_skylander_portal", "Emulate Skylander Portal; disabled|enabled" },
@@ -1231,6 +1246,13 @@ static void libretro_apply_core_options(bool log)
 			cfg.vsync = enabled ? 1 : 0;
 	}
 
+	// Logging
+	if (const char* v = libretro_get_option_value("cemu_logging"))
+	{
+		const bool verbose = libretro_iequals(v, "verbose");
+		libretro_set_verbose_logging(verbose);
+	}
+
 	// Downscale filter
 	if (const char* v = libretro_get_option_value("cemu_downscale_filter"))
 	{
@@ -1362,6 +1384,43 @@ static std::atomic<GLuint> s_current_fbo = 0;
 static std::atomic_uint32_t s_make_current_calls = 0;
 static std::atomic_uint32_t s_make_current_failures = 0;
 static std::atomic_uint32_t s_swapbuffers_calls = 0;
+
+static bool libretro_is_fastforwarding()
+{
+	if (!s_env_cb)
+		return false;
+
+	bool fastforward = false;
+	if (s_env_cb(RETRO_ENVIRONMENT_GET_FASTFORWARDING, &fastforward))
+		return fastforward;
+
+	retro_throttle_state throttle_state = {};
+	if (s_env_cb(RETRO_ENVIRONMENT_GET_THROTTLE_STATE, &throttle_state))
+		return throttle_state.mode == RETRO_THROTTLE_FAST_FORWARD;
+
+	return false;
+}
+
+static bool libretro_consume_frame_ready(bool fastforward)
+{
+	if (s_frame_ready.exchange(false, std::memory_order_acquire))
+		return true;
+
+	if (fastforward)
+		return false;
+
+	// Give the render thread a tiny handoff window without turning retro_run into
+	// the main frame limiter. Fast-forward should remain fully unblocked.
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+	do
+	{
+		std::this_thread::yield();
+		if (s_frame_ready.exchange(false, std::memory_order_acquire))
+			return true;
+	} while (std::chrono::steady_clock::now() < deadline);
+
+	return false;
+}
 
 static fs::path s_system_path;
 static fs::path s_save_path;
@@ -2460,6 +2519,7 @@ extern "C"
 	RETRO_API void RETRO_CALLCONV retro_run(void)
 	{
 		s_frame_count++;
+		const bool fastforward = libretro_is_fastforwarding();
 		if (s_log_cb && libretro_debug_enabled() && (s_frame_count <= 10 || (s_frame_count % 600) == 0))
 			s_log_cb(RETRO_LOG_INFO, "[Cemu] retro_run frame=%d loaded=%d launched=%d hwReady=%d\n", s_frame_count, s_game_loaded ? 1 : 0, s_game_launched ? 1 : 0, s_hw_context_ready ? 1 : 0);
 		
@@ -2788,14 +2848,17 @@ extern "C"
 				s_log_cb(RETRO_LOG_INFO, "[Cemu] FBO from RetroArch: %u\n", (unsigned)fbo);
 		}
 
-		// Present frame to RetroArch
-		// RetroArch expects exactly one video callback per retro_run
-		// Always present whatever we have - let RetroArch handle the pacing
+		// Present frame to RetroArch. Use a real frame-dupe callback when the
+		// render thread has not produced a new frame, matching mature threaded
+		// cores like Flycast and avoiding fake FPS inflation during fast-forward.
 		if (s_hw_context_ready && s_video_cb)
 		{
-			// Consume frame ready flag and always present
-			const bool hasNewFrame = s_frame_ready.exchange(false);
-			(void)hasNewFrame; // We present regardless - RetroArch controls timing
+			const bool hasNewFrame = libretro_consume_frame_ready(fastforward);
+			if (!hasNewFrame)
+			{
+				s_video_cb(nullptr, s_video_width, s_video_height, 0);
+			}
+			else
 			{
 #ifdef ENABLE_VULKAN
 				if (s_graphics_api == GraphicsAPI::Vulkan && s_vulkan_interface)
@@ -2810,8 +2873,6 @@ extern "C"
 					}
 				}
 #endif
-				// Always present the current framebuffer state
-				// RetroArch handles frame pacing - we just provide content
 				s_video_cb(RETRO_HW_FRAME_BUFFER_VALID, s_video_width, s_video_height, 0);
 			}
 		}
