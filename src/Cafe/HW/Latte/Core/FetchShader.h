@@ -69,6 +69,7 @@ struct LatteFetchShader
 	static CacheHash CalculateCacheHash(void* programCode, uint32 programSize);
 	static LatteFetchShader* FindInCacheByHash(CacheHash fsHash);
 	static LatteFetchShader* FindByGPUState();
+	static void ClearCache();
 
 	static std::unordered_map<CacheHash, LatteFetchShader*> s_fetchShaderByHash;
 };

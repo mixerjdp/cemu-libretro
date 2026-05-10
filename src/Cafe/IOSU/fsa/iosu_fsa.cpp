@@ -901,6 +901,8 @@ namespace iosu
 		{
 			IOS_SendMessage(sFSAIoMsgQueue, 0, 0);
 			sFSAIoThread.join();
+			IOS_DestroyMessageQueue(sFSAIoMsgQueue);
+			sFSAIoMsgQueue = -1;
 		}
 	} // namespace fsa
 } // namespace iosu

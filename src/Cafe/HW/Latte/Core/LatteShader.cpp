@@ -4,7 +4,6 @@
 #include "Cafe/HW/Latte/ISA/LatteReg.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h"
-#include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 #include "Cafe/OS/libs/gx2/GX2.h" // todo - remove dependency
@@ -25,6 +24,7 @@
 #include "util/Zir/Core/ZpIRDebug.h"
 #include "Cafe/HW/Latte/Transcompiler/LatteTC.h"
 #include "Cafe/HW/Latte/ShaderInfo/ShaderInfo.h"
+#include "Cafe/HW/Latte/Core/FetchShader.h"
 
 struct _ShaderHashCache
 {
@@ -60,6 +60,20 @@ std::atomic_int g_compiled_shaders_async = 0;
 LatteFetchShader* LatteSHRC_GetActiveFetchShader()
 {
 	return _activeFetchShader;
+}
+
+static void LatteSHRC_ResetFastState()
+{
+	hashCacheVS = {};
+	hashCacheGS = {};
+	hashCachePS = {};
+	_activeFetchShader = nullptr;
+	_activeVertexShader = nullptr;
+	_activeGeometryShader = nullptr;
+	_activePixelShader = nullptr;
+	_shaderBaseHash_vs = 0;
+	_shaderBaseHash_gs = 0;
+	_shaderBaseHash_ps = 0;
 }
 
 LatteDecompilerShader* LatteSHRC_GetActiveVertexShader()
@@ -1075,6 +1089,8 @@ void LatteSHRC_Init()
 	cemu_assert_debug(sVertexShaders.empty());
 	cemu_assert_debug(sGeometryShaders.empty());
 	cemu_assert_debug(sPixelShaders.empty());
+	LatteSHRC_ResetFastState();
+	LatteFetchShader::ClearCache();
 }
 
 void LatteSHRC_UnloadAll()
@@ -1088,4 +1104,5 @@ void LatteSHRC_UnloadAll()
     while(!sPixelShaders.empty())
         LatteShader_free(sPixelShaders.begin()->second);
     cemu_assert_debug(sPixelShaders.empty());
+	LatteSHRC_ResetFastState();
 }

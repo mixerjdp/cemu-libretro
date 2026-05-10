@@ -17,6 +17,8 @@
 .idea/
 
 build/
+build-libretro-win/
+build-standalone-win/
 cmake-build-*/
 out/
 .cache/

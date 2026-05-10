@@ -35,8 +35,25 @@ public:
 
 	~LookupTableL3()
 	{
+		Reset();
 		delete m_placeholderTableY;
 		delete m_placeholderTableZ;
+	}
+
+	void Reset()
+	{
+		for (auto& tableY : m_tableXArr)
+		{
+			if (tableY == m_placeholderTableY)
+				continue;
+			for (auto& tableZ : tableY->arr)
+			{
+				if (tableZ != m_placeholderTableZ)
+					delete tableZ;
+			}
+			delete tableY;
+			tableY = m_placeholderTableY;
+		}
 	}
 
 	// lookup

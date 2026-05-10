@@ -152,6 +152,8 @@ namespace iosu
 			s_requestStop = true;
 			IOS_SendMessage(s_msgQueueId, 0, 0);
 			s_serviceThread.join();
+			IOS_DestroyMessageQueue(s_msgQueueId);
+			s_msgQueueId = -1;
 		}
 	}
 }

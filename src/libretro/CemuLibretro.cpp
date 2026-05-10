@@ -672,6 +672,13 @@ static void libretro_register_core_options()
 	s_log_cb(RETRO_LOG_INFO, "[Cemu] Core options SET_VARIABLES: %s\n", ok ? "accepted" : "rejected");
 }
 
+static void libretro_reset_core_options_state()
+{
+	s_core_options_registered = false;
+	s_core_options_supported = false;
+	s_core_options_runtime_change_warned = false;
+}
+
 static const char* libretro_get_option_value(const char* key)
 {
 	if (!s_core_options_supported)
@@ -2340,6 +2347,8 @@ extern "C"
 
 	RETRO_API void RETRO_CALLCONV retro_set_environment(retro_environment_t cb)
 	{
+		libretro_reset_core_options_state();
+		s_log_cb = nullptr;
 		s_env_cb = cb;
 		
 		// Get log interface early so it's available during context_reset
@@ -2445,7 +2454,6 @@ extern "C"
 	{
 		if (s_log_cb && libretro_debug_enabled())
 			s_log_cb(RETRO_LOG_INFO, "[Cemu] retro_deinit begin loaded=%d launched=%d\n", s_game_loaded ? 1 : 0, s_game_launched ? 1 : 0);
-		libretro_shutdown_logging();
 		if (s_graphic_packs_update_thread.joinable())
 			s_graphic_packs_update_thread.join();
 		s_graphic_packs_update_async_state.store(GraphicPacksUpdateAsyncState::Idle);
@@ -2471,6 +2479,8 @@ extern "C"
 #endif
 		if (s_log_cb && libretro_debug_enabled())
 			s_log_cb(RETRO_LOG_INFO, "[Cemu] retro_deinit end\n");
+		libretro_shutdown_logging();
+		libretro_reset_core_options_state();
 	}
 
 	RETRO_API void RETRO_CALLCONV retro_get_system_info(struct retro_system_info* info)

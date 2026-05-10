@@ -583,9 +583,32 @@ void LatteFetchShader::UnregisterInCache()
 		return;
 	s_spinlockFetchShaderCache.lock();
 	auto itr = s_fetchShaderByHash.find(m_cacheHash);
-	cemu_assert(itr == s_fetchShaderByHash.end());
-	s_fetchShaderByHash.erase(itr);
+	cemu_assert(itr != s_fetchShaderByHash.end());
+	if (itr != s_fetchShaderByHash.end())
+		s_fetchShaderByHash.erase(itr);
+	m_isRegistered = false;
 	s_spinlockFetchShaderCache.unlock();
+}
+
+void LatteFetchShader::ClearCache()
+{
+	std::vector<LatteFetchShader*> shaders;
+	s_spinlockFetchShaderCache.lock();
+	shaders.reserve(s_fetchShaderByHash.size());
+	for (auto& itr : s_fetchShaderByHash)
+	{
+		if (itr.second)
+		{
+			itr.second->m_isRegistered = false;
+			shaders.emplace_back(itr.second);
+		}
+	}
+	s_fetchShaderByHash.clear();
+	s_spinlockFetchShaderCache.unlock();
+
+	for (auto* shader : shaders)
+		delete shader;
+	g_fetchShaderLookupCache.Reset();
 }
 
 std::unordered_map<LatteFetchShader::CacheHash, LatteFetchShader*> LatteFetchShader::s_fetchShaderByHash;

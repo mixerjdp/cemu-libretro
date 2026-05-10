@@ -41,6 +41,7 @@
 #include <cstdlib>
 
 #include <functional>
+#include <mutex>
 #include <thread>
 
 // IOSU initializer functions
@@ -445,6 +446,7 @@ void cemu_initForGame()
 	LatteGPUState.isDRCPrimary = ActiveSettings::DisplayDRCEnabled();
 	InfoLog_PrintActiveSettings();
 	s_cemuInitForGameStage.store(12, std::memory_order_relaxed);
+	g_isGPUInitFinished = false;
 	Latte_Start();
 	s_cemuInitForGameStage.store(13, std::memory_order_relaxed);
 	// check for debugger entrypoint bp
@@ -485,6 +487,7 @@ namespace CafeSystem
     void MlcStorageUnmountAllTitles();
 
     static bool s_initialized = false;
+	static bool s_processInitialized = false;
 	static SystemImplementation* s_implementation{nullptr};
     bool sLaunchModeIsStandalone = false;
 	std::optional<std::vector<std::string>> s_overrideArgs;
@@ -617,10 +620,18 @@ namespace CafeSystem
 		s_initialized = true;
 		// init core systems
 		cemuLog_log(LogType::Force, "------- Init {} -------", BUILD_VERSION_WITH_NAME_STRING);
-		fsc_init();
-		memory_init();
-		cemuLog_log(LogType::Force, "Init Wii U memory space (base: 0x{:016x})", (size_t)memory_base);
-		PPCCore_init();
+		if (!s_processInitialized)
+		{
+			cemuLog_log(LogType::Force, "[CafeSystem] Process init: fsc/memory/ppc/allocators begin");
+			fsc_init();
+			memory_init();
+			cemuLog_log(LogType::Force, "Init Wii U memory space (base: 0x{:016x})", (size_t)memory_base);
+			PPCCore_init();
+		}
+		else
+		{
+			cemuLog_log(LogType::Force, "[CafeSystem] Process init already done; reusing Wii U memory space (base: 0x{:016x})", (size_t)memory_base);
+		}
 		RPLLoader_InitState();
 		cemuLog_log(LogType::Force, "mlc01 path: {}", _pathToUtf8(ActiveSettings::GetMlcPath()));
 		_CheckForWine();
@@ -629,16 +640,24 @@ namespace CafeSystem
 		logPlatformInfo();
 		cemuLog_log(LogType::Force, "Used CPU extensions: {}", g_CPUFeatures.GetCommaSeparatedExtensionList());
 		// misc systems
-		rplSymbolStorage_init();
+		if (!s_processInitialized)
+			rplSymbolStorage_init();
 		// allocate memory for all SysAllocators
 		// must happen before COS module init, but also before iosu::kernel::Initialize()
-		SysAllocatorContainer::GetInstance().Initialize();
+		if (!s_processInitialized)
+			SysAllocatorContainer::GetInstance().Initialize();
+		s_processInitialized = true;
 		// init IOSU modules
+		cemuLog_log(LogType::Force, "[CafeSystem] IOSU SystemLaunch begin");
 		for(auto& module : s_iosuModules)
 			module->SystemLaunch();
+		cemuLog_log(LogType::Force, "[CafeSystem] IOSU SystemLaunch end");
 		// init IOSU (deprecated manual init)
+		cemuLog_log(LogType::Force, "[CafeSystem] Deprecated IOSU init begin");
 		iosuCrypto_init();
+		cemuLog_log(LogType::Force, "[CafeSystem] iosuCrypto_init end");
 		iosu::fsa::Initialize();
+		cemuLog_log(LogType::Force, "[CafeSystem] fsa init end");
 		iosuIoctl_init();
 		iosuAct_init_depr();
 		iosu::act::Initialize();
@@ -647,7 +666,9 @@ namespace CafeSystem
 		iosu::iosuAcp_init();
 		iosu::nim::Initialize();
 		iosu::odm::Initialize();
+		cemuLog_log(LogType::Force, "[CafeSystem] Deprecated IOSU init end");
 		// init Cafe OS
+		cemuLog_log(LogType::Force, "[CafeSystem] Cafe OS modules init begin");
 		avm::Initialize();
 		drmapp::Initialize();
 		TCL::Initialize();
@@ -664,6 +685,7 @@ namespace CafeSystem
 		ntag::Initialize();
 		// init hardware register interfaces
 		HW_SI::Initialize();
+		cemuLog_log(LogType::Force, "[CafeSystem] Cafe OS modules init end");
 	}
 
 	void SetImplementation(SystemImplementation* impl)
@@ -877,6 +899,42 @@ namespace CafeSystem
 
 	#ifdef RETRO_CORE
 	static std::atomic<bool> s_libretro_use_multicore{true};
+	static std::mutex s_libretro_launchThreadMutex;
+	static std::thread s_libretro_launchThread;
+
+	static void JoinLibretroLaunchThread()
+	{
+		std::thread threadToJoin;
+		{
+			std::scoped_lock lock(s_libretro_launchThreadMutex);
+			if (s_libretro_launchThread.joinable())
+				threadToJoin = std::move(s_libretro_launchThread);
+		}
+		if (threadToJoin.joinable())
+		{
+			if (threadToJoin.get_id() == std::this_thread::get_id())
+				threadToJoin.detach();
+			else
+				threadToJoin.join();
+		}
+	}
+
+	static void WaitForLibretroLaunchThreadToReachScheduler()
+	{
+		auto hasLaunchThread = []()
+		{
+			std::scoped_lock lock(s_libretro_launchThreadMutex);
+			return s_libretro_launchThread.joinable();
+		};
+
+		while (hasLaunchThread())
+		{
+			const uint32 stage = GetLaunchThreadStage();
+			if (stage >= 4 || stage == 0xFFFFFFFFu)
+				break;
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	}
 	#endif
 
 	PREPARE_STATUS_CODE PrepareForegroundTitleFromStandaloneRPX(const fs::path& path)
@@ -975,8 +1033,16 @@ namespace CafeSystem
 		sSystemRunning = true;
 		WindowSystem::NotifyGameLoaded();
 		s_launchThreadStage.store(0, std::memory_order_relaxed);
+#ifdef RETRO_CORE
+		JoinLibretroLaunchThread();
+		{
+			std::scoped_lock lock(s_libretro_launchThreadMutex);
+			s_libretro_launchThread = std::thread(_LaunchTitleThread);
+		}
+#else
 		std::thread t(_LaunchTitleThread);
 		t.detach();
+#endif
 		if (CafeSystem_libretro_debug_enabled())
 			cemuLog_log(LogType::Force, "[CafeSystem] LaunchForegroundTitle end tid={} launchThreadStage={}", (unsigned long long)CafeSystem_get_tid(), (unsigned)GetLaunchThreadStage());
 	}
@@ -1146,7 +1212,13 @@ namespace CafeSystem
 				(uint64)GetForegroundTitleId());
 		if(!sSystemRunning)
 			return;
+#ifdef RETRO_CORE
+		WaitForLibretroLaunchThreadToReachScheduler();
+#endif
 		coreinit::OSSchedulerEnd();
+#ifdef RETRO_CORE
+		JoinLibretroLaunchThread();
+#endif
 		if (CafeSystem_libretro_debug_enabled())
 			cemuLog_log(LogType::Force, "[CafeSystem] ShutdownTitle after OSSchedulerEnd");
 		Latte_Stop();

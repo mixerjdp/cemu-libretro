@@ -266,6 +266,8 @@ namespace iosu
 		{
 			IOS_SendMessage(sMCPIoMsgQueue, 0, 0);
 			sMCPIoThread.join();
+			IOS_DestroyMessageQueue(sMCPIoMsgQueue);
+			sMCPIoMsgQueue = -1;
 		}
 	};
 }
