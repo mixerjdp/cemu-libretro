@@ -27,7 +27,7 @@
 #include <vulkan/vulkan.h>
 
 #define RETRO_HW_RENDER_INTERFACE_VULKAN_VERSION 5
-#define RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION 2
+#define RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION 1
 
 struct retro_vulkan_image
 {
@@ -44,7 +44,6 @@ typedef void (*retro_vulkan_set_image_t)(void *handle,
 
 typedef uint32_t (*retro_vulkan_get_sync_index_t)(void *handle);
 typedef uint32_t (*retro_vulkan_get_sync_index_mask_t)(void *handle);
-typedef uint32_t (*retro_vulkan_get_num_swapchain_images_t)(void *handle);
 typedef void (*retro_vulkan_set_command_buffers_t)(void *handle,
       uint32_t num_cmd,
       const VkCommandBuffer *cmd);
@@ -81,32 +80,6 @@ typedef bool (*retro_vulkan_create_device_t)(
 
 typedef void (*retro_vulkan_destroy_device_t)(void);
 
-/* v2 CONTEXT_NEGOTIATION_INTERFACE only. */
-typedef VkInstance (*retro_vulkan_create_instance_wrapper_t)(
-      void *opaque, const VkInstanceCreateInfo *create_info);
-
-/* v2 CONTEXT_NEGOTIATION_INTERFACE only. */
-typedef VkInstance (*retro_vulkan_create_instance_t)(
-      PFN_vkGetInstanceProcAddr get_instance_proc_addr,
-      const VkApplicationInfo *app,
-      retro_vulkan_create_instance_wrapper_t create_instance_wrapper,
-      void *opaque);
-
-/* v2 CONTEXT_NEGOTIATION_INTERFACE only. */
-typedef VkDevice (*retro_vulkan_create_device_wrapper_t)(
-      VkPhysicalDevice gpu, void *opaque,
-      const VkDeviceCreateInfo *create_info);
-
-/* v2 CONTEXT_NEGOTIATION_INTERFACE only. */
-typedef bool (*retro_vulkan_create_device2_t)(
-      struct retro_vulkan_context *context,
-      VkInstance instance,
-      VkPhysicalDevice gpu,
-      VkSurfaceKHR surface,
-      PFN_vkGetInstanceProcAddr get_instance_proc_addr,
-      retro_vulkan_create_device_wrapper_t create_device_wrapper,
-      void *opaque);
-
 struct retro_hw_render_context_negotiation_interface_vulkan
 {
    enum retro_hw_render_context_negotiation_interface_type interface_type;
@@ -117,10 +90,6 @@ struct retro_hw_render_context_negotiation_interface_vulkan
    retro_vulkan_create_device_t create_device;
 
    retro_vulkan_destroy_device_t destroy_device;
-
-   retro_vulkan_create_instance_t create_instance;
-
-   retro_vulkan_create_device2_t create_device2;
 };
 
 struct retro_hw_render_interface_vulkan
@@ -145,8 +114,6 @@ struct retro_hw_render_interface_vulkan
    retro_vulkan_get_sync_index_t get_sync_index;
 
    retro_vulkan_get_sync_index_mask_t get_sync_index_mask;
-
-   retro_vulkan_get_num_swapchain_images_t get_num_swapchain_images;
 
    retro_vulkan_set_command_buffers_t set_command_buffers;
 

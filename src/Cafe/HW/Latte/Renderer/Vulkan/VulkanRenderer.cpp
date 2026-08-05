@@ -70,7 +70,6 @@ namespace
 {
 	VkApplicationInfo s_libretroAppInfo{};
 	retro_hw_render_context_negotiation_interface_vulkan s_ctxNegotiationInterface{};
-	bool s_libretro_createDevice2Called = false; // diagnostic: did the frontend call our create_device2?
 
 	const VkApplicationInfo* libretro_vk_getApplicationInfo()
 	{
@@ -117,10 +116,27 @@ namespace
 		return false;
 	}
 
-	bool libretro_vk_createDevice2(struct retro_vulkan_context* context, VkInstance instance, VkPhysicalDevice gpu, VkSurfaceKHR surface, PFN_vkGetInstanceProcAddr get_instance_proc_addr, retro_vulkan_create_device_wrapper_t create_device_wrapper, void* opaque)
+	// Shared builder for the version 1 negotiation entry point. It merges the
+	// frontend's requirements with Cemu's before creating the shared device.
+	template<typename TCreateFn>
+	bool libretro_vk_buildDevice(struct retro_vulkan_context* context, VkInstance instance, VkPhysicalDevice gpu, VkSurfaceKHR surface,
+		PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+		const char* const* extraExtensions, unsigned numExtraExtensions,
+		const char* const* extraLayers, unsigned numExtraLayers,
+		const VkPhysicalDeviceFeatures* extraFeatures,
+		TCreateFn&& createDeviceFn)
 	{
-		s_libretro_createDevice2Called = true;
-		cemuLog_log(LogType::Force, "[Vulkan] libretro create_device2 called (gpu={} surface={})", (void*)gpu, (void*)surface);
+		// This runs during the frontend's device creation, BEFORE the VulkanRenderer constructor,
+		// so our instance-level Vulkan entry points are not loaded yet. Load them through the
+		// frontend-provided loader so the physical-device queries below work.
+		if (get_instance_proc_addr)
+			vkGetInstanceProcAddr = get_instance_proc_addr;
+		if (!get_instance_proc_addr || !InitializeInstanceVulkan(instance))
+		{
+			cemuLog_log(LogType::Force, "[Vulkan] libretro buildDevice: unable to load instance functions");
+			return false;
+		}
+
 		// pick a physical device if the frontend left the choice to us
 		if (gpu == VK_NULL_HANDLE)
 		{
@@ -138,18 +154,28 @@ namespace
 			}
 			if (gpu == VK_NULL_HANDLE)
 			{
-				cemuLog_log(LogType::Force, "[Vulkan] libretro create_device2: no suitable physical device found");
+				cemuLog_log(LogType::Force, "[Vulkan] libretro buildDevice: no suitable physical device found");
 				return false;
 			}
 		}
 
 		VulkanRenderer::FeatureControl featureControl;
-		VulkanRenderer::CheckDeviceExtensionSupport(gpu, featureControl);
+		if (!VulkanRenderer::CheckDeviceExtensionSupport(gpu, featureControl))
+		{
+			cemuLog_log(LogType::Force, "[Vulkan] libretro buildDevice: Cemu's required device extensions are unavailable");
+			return false;
+		}
+		// These extensions are useful for Cemu's own swapchain, but not for the
+		// frontend-owned libretro presentation path. Keep the shared device on the
+		// portable Vulkan 1.x paths (as Flycast does) instead of enabling optional
+		// NVIDIA pipeline/present features which RetroArch 1.20 never consumes.
+		featureControl.deviceExtensions.present_wait = false;
+		featureControl.deviceExtensions.pipeline_robustness = false;
 
 		uint32_t queueFamilyIndex = 0;
 		if (!libretro_vk_pickQueueFamily(gpu, surface, queueFamilyIndex))
 		{
-			cemuLog_log(LogType::Force, "[Vulkan] libretro create_device2: no suitable queue family found");
+			cemuLog_log(LogType::Force, "[Vulkan] libretro buildDevice: no suitable queue family found");
 			return false;
 		}
 
@@ -177,6 +203,16 @@ namespace
 			deviceFeatures.robustBufferAccess = VK_TRUE;
 		if (featureControl.mode.useTFEmulationViaSSBO)
 			deviceFeatures.vertexPipelineStoresAndAtomics = VK_TRUE;
+
+		// merge in the features the frontend requires (v1 negotiation). VkPhysicalDeviceFeatures
+		// is a flat array of VkBool32, so OR them field by field.
+		if (extraFeatures)
+		{
+			VkBool32* dst = reinterpret_cast<VkBool32*>(&deviceFeatures);
+			const VkBool32* src = reinterpret_cast<const VkBool32*>(extraFeatures);
+			for (size_t i = 0; i < sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32); i++)
+				dst[i] = (dst[i] || src[i]) ? VK_TRUE : VK_FALSE;
+		}
 
 		// feature extension structs (keep alive until vkCreateDevice returns)
 		VkPhysicalDevicePipelineCreationCacheControlFeaturesEXT cacheControlFeature{};
@@ -255,6 +291,21 @@ namespace
 		if (featureControl.deviceExtensions.pipeline_robustness)
 			used_extensions.emplace_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
 
+		// merge in the device extensions the frontend requires (v1 negotiation), avoiding duplicates
+		for (unsigned i = 0; i < numExtraExtensions; i++)
+		{
+			const char* ext = extraExtensions[i];
+			if (!ext)
+				continue;
+			bool present = false;
+			for (const char* e : used_extensions)
+			{
+				if (strcmp(e, ext) == 0) { present = true; break; }
+			}
+			if (!present)
+				used_extensions.emplace_back(ext);
+		}
+
 		VkDeviceCreateInfo createInfo{};
 		createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		createInfo.pQueueCreateInfos = &queueCreateInfo;
@@ -262,16 +313,21 @@ namespace
 		createInfo.pEnabledFeatures = &deviceFeatures;
 		createInfo.enabledExtensionCount = (uint32_t)used_extensions.size();
 		createInfo.ppEnabledExtensionNames = used_extensions.data();
+		createInfo.enabledLayerCount = numExtraLayers;
+		createInfo.ppEnabledLayerNames = extraLayers;
 		createInfo.pNext = deviceExtensionFeatures;
 
-		VkDevice device = create_device_wrapper(gpu, opaque, &createInfo);
+		VkDevice device = createDeviceFn(gpu, &createInfo);
 		if (device == VK_NULL_HANDLE)
 			return false;
 
+		// device-level functions are not loaded yet; fetch vkGetDeviceQueue via the instance loader
 		VkQueue queue = VK_NULL_HANDLE;
-		vkGetDeviceQueue(device, queueFamilyIndex, 0, &queue);
+		auto pfnGetDeviceQueue = reinterpret_cast<PFN_vkGetDeviceQueue>(get_instance_proc_addr(instance, "vkGetDeviceQueue"));
+		if (pfnGetDeviceQueue)
+			pfnGetDeviceQueue(device, queueFamilyIndex, 0, &queue);
 
-		cemuLog_log(LogType::Force, "[Vulkan] libretro create_device2 success: queue family {}, {} device extensions enabled", queueFamilyIndex, (uint32)used_extensions.size());
+		cemuLog_log(LogType::Force, "[Vulkan] libretro buildDevice success: queue family {}, {} device extensions enabled", queueFamilyIndex, (uint32)used_extensions.size());
 
 		context->gpu = gpu;
 		context->device = device;
@@ -280,6 +336,32 @@ namespace
 		context->presentation_queue = queue;
 		context->presentation_queue_family_index = queueFamilyIndex;
 		return true;
+	}
+
+	// Version 1 is the libretro Vulkan negotiation ABI used by the local
+	// RetroArch/Flycast headers.
+	bool libretro_vk_createDevice(struct retro_vulkan_context* context, VkInstance instance, VkPhysicalDevice gpu, VkSurfaceKHR surface,
+		PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+		const char** required_device_extensions, unsigned num_required_device_extensions,
+		const char** required_device_layers, unsigned num_required_device_layers,
+		const VkPhysicalDeviceFeatures* required_features)
+	{
+		cemuLog_log(LogType::Force, "[Vulkan] libretro create_device (v1) called (gpu={} surface={} reqExt={})", (void*)gpu, (void*)surface, num_required_device_extensions);
+		auto pfnCreateDevice = reinterpret_cast<PFN_vkCreateDevice>(get_instance_proc_addr(instance, "vkCreateDevice"));
+		if (!pfnCreateDevice)
+		{
+			cemuLog_log(LogType::Force, "[Vulkan] create_device v1: vkCreateDevice not available");
+			return false;
+		}
+		return libretro_vk_buildDevice(context, instance, gpu, surface, get_instance_proc_addr,
+			required_device_extensions, num_required_device_extensions,
+			required_device_layers, num_required_device_layers, required_features,
+			[&](VkPhysicalDevice g, const VkDeviceCreateInfo* ci) -> VkDevice {
+				VkDevice d = VK_NULL_HANDLE;
+				if (pfnCreateDevice(g, ci, nullptr, &d) != VK_SUCCESS)
+					return VkDevice(VK_NULL_HANDLE);
+				return d;
+			});
 	}
 
 	void libretro_vk_destroyDevice()
@@ -293,10 +375,8 @@ struct retro_hw_render_context_negotiation_interface_vulkan* VulkanRenderer::Get
 	s_ctxNegotiationInterface.interface_type = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN;
 	s_ctxNegotiationInterface.interface_version = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION;
 	s_ctxNegotiationInterface.get_application_info = libretro_vk_getApplicationInfo;
-	s_ctxNegotiationInterface.create_device = nullptr;
+	s_ctxNegotiationInterface.create_device = libretro_vk_createDevice;
 	s_ctxNegotiationInterface.destroy_device = libretro_vk_destroyDevice;
-	s_ctxNegotiationInterface.create_instance = nullptr;
-	s_ctxNegotiationInterface.create_device2 = libretro_vk_createDevice2;
 	return &s_ctxNegotiationInterface;
 }
 
@@ -324,16 +404,20 @@ void VulkanRenderer::libretro_vk_initPresentation(uint32_t width, uint32_t heigh
 	const VkFormat imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
 	m_libretroExtent = { width, height };
 
-	uint32_t numImages = 3;
-	if (s_libretro_vk_interface && s_libretro_vk_interface->get_num_swapchain_images)
-	{
-		const uint32_t reported = s_libretro_vk_interface->get_num_swapchain_images(s_libretro_vk_interface->handle);
-		cemuLog_log(LogType::Force, "[Vulkan] get_num_swapchain_images reported {}", reported);
-		numImages = reported;
-	}
-	// clamp to a sane range: a bogus/huge value here would create hundreds of present images and
-	// exhaust VRAM (each image is width*height*4 bytes).
-	numImages = std::clamp(numImages, 2u, 8u);
+	// The v5 interface reports the frontend's frame slots as a bit mask. There
+	// is no get_num_swapchain_images callback; adding one shifts every following
+	// function pointer and makes queue synchronization undefined.
+	uint32_t syncIndexMask = 0;
+	if (s_libretro_vk_interface && s_libretro_vk_interface->get_sync_index_mask)
+		syncIndexMask = s_libretro_vk_interface->get_sync_index_mask(s_libretro_vk_interface->handle);
+	uint32_t numImages = 0;
+	for (uint32_t mask = syncIndexMask; mask != 0; mask >>= 1)
+		++numImages;
+	if (numImages == 0)
+		numImages = 3;
+	if (numImages > 8)
+		throw std::runtime_error(fmt::format("Unsupported libretro Vulkan sync-index mask {:#x}", syncIndexMask));
+	cemuLog_log(LogType::Force, "[Vulkan] libretro sync-index mask {:#x}, allocating {} presentation images", syncIndexMask, numImages);
 
 	// create render pass (color attachment, store to color attachment layout)
 	VkAttachmentDescription colorAttachment{};
@@ -388,6 +472,7 @@ void VulkanRenderer::libretro_vk_initPresentation(uint32_t width, uint32_t heigh
 	{
 		VkImageCreateInfo imageInfo{};
 		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 		imageInfo.imageType = VK_IMAGE_TYPE_2D;
 		imageInfo.extent = { width, height, 1 };
 		imageInfo.mipLevels = 1;
@@ -512,7 +597,10 @@ void VulkanRenderer::libretro_vk_destroyPresentation()
 
 const struct retro_vulkan_image* VulkanRenderer::libretro_vk_getLastFrameImage() const
 {
-	if (m_libretroImageViews.empty())
+	// DrawEmptyFrame() submits an otherwise empty command buffer while Cemu is
+	// booting. Do not expose a presentation image until DrawBackbufferQuad()
+	// has rendered and transitioned one to SHADER_READ_ONLY_OPTIMAL.
+	if (m_libretroImageViews.empty() || m_libretroPresentCounter.load(std::memory_order_acquire) == 0)
 		return nullptr;
 	const uint32_t imageIndex = m_libretroLastFrameImage.load(std::memory_order_acquire);
 	if (imageIndex >= m_libretroImageViews.size())
@@ -849,24 +937,34 @@ VulkanRenderer::VulkanRenderer()
 		// dispatch does not match the device RetroArch created. That mismatch makes calls like
 		// vkAllocateMemory fail (VK_ERROR_OUT_OF_DEVICE_MEMORY) and can hang the GPU. This is what
 		// the flycast libretro renderer does (it loads all symbols via the interface's proc addrs).
-		cemuLog_log(LogType::Force, "[Vulkan] libretro diagnostics: create_device2_called={} frontend_instance_proc={} our_instance_proc={} frontend_device_proc={}",
-			s_libretro_createDevice2Called ? 1 : 0,
-			(void*)s_libretro_vk_interface->get_instance_proc_addr,
-			(void*)vkGetInstanceProcAddr,
-			(void*)s_libretro_vk_interface->get_device_proc_addr);
 		if (s_libretro_vk_interface->get_instance_proc_addr)
 			vkGetInstanceProcAddr = s_libretro_vk_interface->get_instance_proc_addr;
-		if (s_libretro_vk_interface->get_device_proc_addr)
+		// Match Flycast's libretro loader path. vkGetDeviceProcAddr is a global
+		// command, so RetroArch's loader expects VK_NULL_HANDLE here (not its
+		// instance dispatch handle). Asking through the instance has returned a
+		// mismatched dispatcher on RetroArch 1.20, turning device destruction
+		// calls into vkGetInstanceProcAddr(device, nullptr).
+		if (s_libretro_vk_interface->get_instance_proc_addr)
+		{
+			auto instanceGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+				s_libretro_vk_interface->get_instance_proc_addr(VK_NULL_HANDLE, "vkGetDeviceProcAddr"));
+			if (instanceGetDeviceProcAddr)
+				vkGetDeviceProcAddr = instanceGetDeviceProcAddr;
+		}
+		if (!vkGetDeviceProcAddr && s_libretro_vk_interface->get_device_proc_addr)
 			vkGetDeviceProcAddr = s_libretro_vk_interface->get_device_proc_addr;
 
 		if (!InitializeInstanceVulkan(m_instance))
 			throw std::runtime_error("Unable to load instanced Vulkan functions");
 		if (!InitializeDeviceVulkan(m_logicalDevice))
 			throw std::runtime_error("Unable to load device Vulkan functions");
-
 		CheckDeviceExtensionSupport(m_physicalDevice, m_featureControl);
 		DetermineVendor();
 		GetDeviceFeatures();
+		// The device was negotiated for libretro presentation, not Cemu's own
+		// swapchain. Avoid optional present/pipeline-robustness paths here too.
+		m_featureControl.deviceExtensions.present_wait = false;
+		m_featureControl.deviceExtensions.pipeline_robustness = false;
 
 		// init memory manager
 		memoryManager.reset(new VKRMemoryManager(this));
@@ -1187,12 +1285,14 @@ VulkanRenderer::VulkanRenderer()
 
 VulkanRenderer::~VulkanRenderer()
 {
-#ifdef RETRO_CORE
-	libretro_vk_destroyPresentation();
-#endif
 	SubmitCommandBuffer();
 	WaitDeviceIdle();
 	WaitCommandBufferFinished(GetCurrentCommandBufferId());
+#ifdef RETRO_CORE
+	// RetroArch may still sample a presented image. Release it only after all
+	// work on the shared device has completed.
+	libretro_vk_destroyPresentation();
+#endif
 	// make sure compilation threads have been shut down
 	RendererShaderVk::Shutdown();
 	// shut down pipeline save thread
@@ -1225,8 +1325,12 @@ VulkanRenderer::~VulkanRenderer()
 
 	vkDestroyDescriptorSetLayout(m_logicalDevice, m_swapchainDescriptorSetLayout, nullptr);
 
-	// shut down imgui
+	// The libretro core is headless and never calls ImGui_ImplVulkan_Init().
+	// Shutting down the backend anyway makes it touch ImGui's uninitialized
+	// Vulkan state while RetroArch is tearing down the shared device.
+#ifndef RETRO_CORE
 	ImGui_ImplVulkan_Shutdown();
+#endif
 
 	// delete null objects
 	DeleteNullObjects();
@@ -2270,7 +2374,10 @@ void VulkanRenderer::Shutdown()
 {
 	SubmitCommandBuffer();
 	WaitDeviceIdle();
+
+#ifndef RETRO_CORE
 	DeleteFontTextures();
+#endif
 	Renderer::Shutdown();
 	if (m_imguiRenderPass != VK_NULL_HANDLE)
 	{
@@ -2444,6 +2551,14 @@ void VulkanRenderer::QueryAvailableFormats()
 
 bool VulkanRenderer::ImguiBegin(bool mainWindow)
 {
+#ifdef RETRO_CORE
+	// The standalone ImGui backend draws into Cemu's own swapchain. A libretro
+	// core has no such swapchain: RetroArch owns the presentation images and the
+	// only valid output path is DrawBackbufferQuad(). In particular, shader-cache
+	// progress UI must not record ImGui commands against an uninitialized
+	// SwapchainInfoVk, which reaches the NVIDIA driver during title startup.
+	return false;
+#endif
 	if (!Renderer::ImguiBegin(mainWindow))
 		return false;
 
@@ -2464,6 +2579,9 @@ bool VulkanRenderer::ImguiBegin(bool mainWindow)
 
 void VulkanRenderer::ImguiEnd()
 {
+#ifdef RETRO_CORE
+	return;
+#endif
 	ImGui::Render();
 	ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), m_state.currentCommandBuffer);
 	vkCmdEndRenderPass(m_state.currentCommandBuffer);
@@ -2471,6 +2589,11 @@ void VulkanRenderer::ImguiEnd()
 
 ImTextureID VulkanRenderer::GenerateTexture(const std::vector<uint8>& data, const Vector2i& size)
 {
+#ifdef RETRO_CORE
+	// Shader-cache progress UI uses ImGui textures. The libretro renderer is
+	// intentionally headless, so there is no ImGui Vulkan backend to own them.
+	return nullptr;
+#endif
 	try
 	{
 		std::vector <uint8> tmp(size.x * size.y * 4);
@@ -2492,12 +2615,20 @@ ImTextureID VulkanRenderer::GenerateTexture(const std::vector<uint8>& data, cons
 
 void VulkanRenderer::DeleteTexture(ImTextureID id)
 {
+#ifdef RETRO_CORE
+	return;
+#endif
 	WaitDeviceIdle();
 	ImGui_ImplVulkan_DeleteTexture(id);
 }
 
 void VulkanRenderer::DeleteFontTextures()
 {
+#ifdef RETRO_CORE
+	// ImGui's Vulkan backend is intentionally never initialized in the
+	// headless libretro core.
+	return;
+#endif
 	WaitDeviceIdle();
 	ImGui_ImplVulkan_DestroyFontsTexture();
 }
@@ -3345,6 +3476,14 @@ bool VulkanRenderer::AcquireNextSwapchainImage(bool mainWindow)
 
 void VulkanRenderer::RecreateSwapchain(bool mainWindow, bool skipCreate)
 {
+#ifdef RETRO_CORE
+	if (IsRetroLibretroDevice())
+	{
+		// RetroArch owns the swapchain in HW-render mode. Cemu's window swapchain
+		// and its ImGui companion must never be recreated by the core.
+		return;
+	}
+#endif
 	SubmitCommandBuffer();
 	WaitDeviceIdle();
 	auto& chainInfo = GetChainInfo(mainWindow);
@@ -3501,22 +3640,27 @@ void VulkanBenchmarkPrintResults();
 
 void VulkanRenderer::SwapBuffers(bool swapTV, bool swapDRC)
 {
-	SubmitCommandBuffer();
-
 #ifdef RETRO_CORE
-	// In libretro mode, signal frame ready even without swapchain
-	if (swapTV || swapDRC)
+	if (IsRetroLibretroDevice())
 	{
-		extern std::atomic_bool s_frame_ready;
-		s_frame_ready.store(true, std::memory_order_release);
+		// The libretro presentation path submits only after it has rendered a real
+		// output image in DrawBackbufferQuad(). A swap request can also occur while
+		// booting or compiling shaders, when the current command buffer is empty;
+		// do not submit that buffer to RetroArch's shared queue.
+		if (swapTV)
+			VulkanBenchmarkPrintResults();
+		return;
 	}
 #else
+#endif
+
+	SubmitCommandBuffer();
+
 	if (swapTV && IsSwapchainInfoValid(true))
 		SwapBuffer(true);
 
 	if (swapDRC && IsSwapchainInfoValid(false))
 		SwapBuffer(false);
-#endif
 
 	if(swapTV)
 		VulkanBenchmarkPrintResults();
@@ -3607,26 +3751,30 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
 	{
 		// In libretro mode we render into our own images which are presented to RetroArch via retro_vulkan_set_image_t
 		extern std::atomic_bool s_frame_ready;
-
 		if (!s_libretro_vk_interface || m_libretroImages.empty())
 		{
 			s_frame_ready.store(true, std::memory_order_release);
 			return;
 		}
 
-		const uint32_t imageIndex = m_libretroNextImageIndex;
+		uint32_t imageIndex = 0;
+		if (s_libretro_vk_interface->get_sync_index)
+			imageIndex = s_libretro_vk_interface->get_sync_index(s_libretro_vk_interface->handle);
 		if (imageIndex >= m_libretroImages.size())
 		{
 			s_frame_ready.store(true, std::memory_order_release);
 			return;
 		}
-
 		LatteTextureViewVk* texViewVk = (LatteTextureViewVk*)texView;
 		draw_endRenderPass();
 
 		// wait for the previous submit which rendered into this image (if any) before reusing it
 		if (m_libretroImagePresented[imageIndex])
 		{
+			// RetroArch may transition the image while compositing it. Its sync
+			// index wait establishes that the image was returned to the core.
+			if (s_libretro_vk_interface->wait_sync_index)
+				s_libretro_vk_interface->wait_sync_index(s_libretro_vk_interface->handle);
 			const uint32_t lastCmdBufferIndex = m_libretroImageCmdBufferIndices[imageIndex];
 			vkWaitForFences(m_logicalDevice, 1, &m_cmd_buffer_fences[lastCmdBufferIndex], VK_TRUE, UINT64_MAX);
 		}
@@ -3634,7 +3782,9 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
 		// transition target image to color attachment
 		VkImageMemoryBarrier toColorAttachment{};
 		toColorAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-		toColorAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		toColorAttachment.oldLayout = m_libretroImagePresented[imageIndex]
+			? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+			: VK_IMAGE_LAYOUT_UNDEFINED;
 		toColorAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 		toColorAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		toColorAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -3654,7 +3804,6 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
 		vkCmdPipelineBarrier(m_state.currentCommandBuffer, srcStage, dstStage, 0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
 
 		auto pipeline = backbufferBlit_createGraphicsPipelineInternal(m_swapchainDescriptorSetLayout, m_libretroRenderPass, padView, shader);
-
 		VkRenderPassBeginInfo renderPassInfo = {};
 		renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 		renderPassInfo.renderPass = m_libretroRenderPass;
@@ -3749,14 +3898,11 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
 		// frames), which leaves it signaled and trips a double-signal when the image is reused.
 		const uint32_t submittedCmdBufferIndex = m_commandBufferIndex;
 		SubmitCommandBuffer();
-
 		m_libretroImageCmdBufferIndices[imageIndex] = submittedCmdBufferIndex;
 		m_libretroImagePresented[imageIndex] = 1;
 		m_libretroImagePresentInfo[imageIndex].image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 		m_libretroLastFrameImage.store(imageIndex, std::memory_order_release);
 		m_libretroPresentCounter.fetch_add(1, std::memory_order_release);
-		m_libretroNextImageIndex = (imageIndex + 1) % (uint32_t)m_libretroImages.size();
-
 		s_frame_ready.store(true, std::memory_order_release);
 		return;
 	}

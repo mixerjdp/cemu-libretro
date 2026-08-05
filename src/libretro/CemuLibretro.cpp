@@ -2173,12 +2173,12 @@ static void RETRO_CALLCONV libretro_context_destroy()
     s_hw_context_ready = false;
 
 #ifdef ENABLE_VULKAN
-    // Cleanup Vulkan presentation resources (while the device is still alive; RetroArch destroys the device after context_destroy)
+    // The renderer waits for the shared device before releasing its presentation
+    // images. RetroArch destroys the device only after this callback returns.
     if (g_renderer && s_graphics_api == GraphicsAPI::Vulkan)
     {
         try
         {
-            ((VulkanRenderer*)g_renderer.get())->libretro_vk_destroyPresentation();
             g_renderer.reset();
         }
         catch (...)
