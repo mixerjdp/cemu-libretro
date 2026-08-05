@@ -1362,6 +1362,12 @@ void LatteCP_ProcessRingbuffer()
 	uint32be tmpBuffer[128];
 	while (true)
 	{
+		// Latte_Stop() requests a hard stop before the title memory and GPU
+		// state are torn down. Do not drain commands that were queued by the
+		// title: they can reference state which is already being shut down.
+		if (Latte_GetStopSignal())
+			LatteThread_Exit();
+
 		uint32 itHeader = LatteCP_readU32Deprc();
 		uint32 itHeaderType = (itHeader >> 30) & 3;
 		if (itHeaderType == 3)

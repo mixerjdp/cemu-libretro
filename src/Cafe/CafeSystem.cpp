@@ -1203,6 +1203,7 @@ namespace CafeSystem
 
 	void ShutdownTitle()
 	{
+		const bool titlePrepared = s_cemuInitForGameStage.load(std::memory_order_relaxed) != 0;
 		if (CafeSystem_libretro_debug_enabled())
 			cemuLog_log(LogType::Force, "[CafeSystem] ShutdownTitle begin tid={} running={} launchStage={} cemuInitStage={} titleId={:016x}",
 				(unsigned long long)CafeSystem_get_tid(),
@@ -1210,7 +1211,7 @@ namespace CafeSystem
 				(unsigned)GetLaunchThreadStage(),
 				(unsigned)GetCemuInitForGameStage(),
 				(uint64)GetForegroundTitleId());
-		if(!sSystemRunning)
+		if (!sSystemRunning && !titlePrepared)
 			return;
 #ifdef RETRO_CORE
 		WaitForLibretroLaunchThreadToReachScheduler();
@@ -1247,6 +1248,7 @@ namespace CafeSystem
         UnmountBaseDirectories();
         DestroyMemorySpace();
 		sSystemRunning = false;
+		s_cemuInitForGameStage.store(0, std::memory_order_relaxed);
 		if (CafeSystem_libretro_debug_enabled())
 			cemuLog_log(LogType::Force, "[CafeSystem] ShutdownTitle end tid={}", (unsigned long long)CafeSystem_get_tid());
 	}

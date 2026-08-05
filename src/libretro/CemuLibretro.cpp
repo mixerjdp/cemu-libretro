@@ -58,6 +58,7 @@ std::atomic_bool g_isGPUInitFinished = false;
 #include <chrono>
 #include <ctime>
 #include <functional>
+#include <mutex>
 #include <thread>
 
 static uint64_t libretro_get_thread_id()
@@ -1077,6 +1078,12 @@ static bool s_game_loaded = false;
 static bool s_game_launched = false;
 static bool s_hw_context_ready = false;
 
+// RetroArch can tear down a core from a different thread while its main loop
+// is still inside retro_run(). Keep the libretro callbacks that touch Cemu's
+// title, renderer, or callbacks serialized just like threaded libretro cores
+// such as Flycast do around their emulation loop.
+static std::recursive_mutex s_libretro_mainloop_mutex;
+
 static void libretro_apply_core_options(bool log)
 {
 	if (!s_env_cb)
@@ -2046,6 +2053,7 @@ static void LoadOpenGLImportsLibretro()
 
 static void RETRO_CALLCONV libretro_context_reset()
 {
+    std::lock_guard<std::recursive_mutex> lock(s_libretro_mainloop_mutex);
     if (s_log_cb) s_log_cb(RETRO_LOG_INFO, "[Cemu] context_reset called (tid=%llu)\n", (unsigned long long)libretro_get_thread_id());
 
     if (!s_hw_render.get_proc_address)
@@ -2168,9 +2176,19 @@ static void RETRO_CALLCONV libretro_context_reset()
 
 static void RETRO_CALLCONV libretro_context_destroy()
 {
+	std::lock_guard<std::recursive_mutex> lock(s_libretro_mainloop_mutex);
 	if (s_log_cb && libretro_debug_enabled())
 		s_log_cb(RETRO_LOG_INFO, "[Cemu] context_destroy called (tid=%llu)\n", (unsigned long long)libretro_get_thread_id());
-    s_hw_context_ready = false;
+
+	// RetroArch destroys the hardware context before retro_unload_game() on
+	// normal frontend shutdown. Stop any prepared emulation state first so its
+	// Latte thread cannot access the renderer while the Vulkan context is released.
+	if (CafeSystem::IsTitleRunning() || CafeSystem::GetCemuInitForGameStage() != 0)
+		CafeSystem::ShutdownTitle();
+	s_game_loaded = false;
+	s_game_launched = false;
+
+	s_hw_context_ready = false;
 
 #ifdef ENABLE_VULKAN
     // The renderer waits for the shared device before releasing its presentation
@@ -2525,6 +2543,7 @@ extern "C"
 
 	RETRO_API void RETRO_CALLCONV retro_deinit(void)
 	{
+		std::lock_guard<std::recursive_mutex> lock(s_libretro_mainloop_mutex);
 		if (s_log_cb && libretro_debug_enabled())
 			s_log_cb(RETRO_LOG_INFO, "[Cemu] retro_deinit begin loaded=%d launched=%d\n", s_game_loaded ? 1 : 0, s_game_launched ? 1 : 0);
 		if (s_graphic_packs_update_thread.joinable())
@@ -2601,6 +2620,7 @@ extern "C"
 
 	RETRO_API void RETRO_CALLCONV retro_run(void)
 	{
+		std::lock_guard<std::recursive_mutex> lock(s_libretro_mainloop_mutex);
 		s_frame_count++;
 		const bool fastforward = libretro_is_fastforwarding();
 		if (s_log_cb && libretro_debug_enabled() && (s_frame_count <= 10 || (s_frame_count % 600) == 0))
@@ -3015,6 +3035,7 @@ extern "C"
 
 	RETRO_API bool RETRO_CALLCONV retro_load_game(const struct retro_game_info* game)
 	{
+		std::lock_guard<std::recursive_mutex> lock(s_libretro_mainloop_mutex);
 		if (s_log_cb && libretro_debug_enabled())
 			s_log_cb(RETRO_LOG_INFO, "[Cemu] retro_load_game begin path=%s\n", (game && game->path) ? game->path : "(null)");
 		if (!game || !game->path)
@@ -3183,28 +3204,23 @@ extern "C"
 
 	RETRO_API void RETRO_CALLCONV retro_unload_game(void)
 	{
-		// Force log to Cemu log.txt immediately to ensure we see this before any crash
-		cemuLog_log(LogType::Force, "[Libretro] retro_unload_game ENTRY launched={} loaded={} tid={}",
-			s_game_launched ? 1 : 0, s_game_loaded ? 1 : 0, (unsigned long long)libretro_get_thread_id());
+		std::lock_guard<std::recursive_mutex> lock(s_libretro_mainloop_mutex);
 		if (s_log_cb && libretro_debug_enabled())
 			s_log_cb(RETRO_LOG_INFO, "[Cemu] retro_unload_game begin launched=%d\n", s_game_launched ? 1 : 0);
 
 		s_libretro_input_active.store(false, std::memory_order_relaxed);
 		WindowSystem::GetWindowInfo().set_keystatesup();
 
-		if (s_game_launched)
+		if (s_game_loaded || s_game_launched)
 		{
-			cemuLog_log(LogType::Force, "[Libretro] retro_unload_game calling ShutdownTitle");
 			if (s_log_cb && libretro_debug_enabled())
 				s_log_cb(RETRO_LOG_INFO, "[Cemu] retro_unload_game calling CafeSystem::ShutdownTitle\n");
 			CafeSystem::ShutdownTitle();
-			cemuLog_log(LogType::Force, "[Libretro] retro_unload_game ShutdownTitle returned");
 			if (s_log_cb && libretro_debug_enabled())
 				s_log_cb(RETRO_LOG_INFO, "[Cemu] retro_unload_game CafeSystem::ShutdownTitle returned\n");
 		}
 		s_game_loaded = false;
 		s_game_launched = false;
-		cemuLog_log(LogType::Force, "[Libretro] retro_unload_game EXIT");
 		if (s_log_cb && libretro_debug_enabled())
 			s_log_cb(RETRO_LOG_INFO, "[Cemu] retro_unload_game end\n");
 	}
