@@ -27,6 +27,10 @@
 
 #include "Cafe/HW/Latte/Core/LatteTiming.h" // vsync control
 
+#ifdef RETRO_CORE
+#include "libretro/libretro_vulkan.h"
+#endif
+
 #include <cstdint>
 #include <glslang/Public/ShaderLang.h>
 
@@ -57,6 +61,478 @@ const std::vector<const char*> kRequiredDeviceExtensions =
 	VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 	VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME
 }; // Intel doesnt support VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME
+
+#ifdef RETRO_CORE
+const struct retro_hw_render_interface_vulkan* VulkanRenderer::s_libretro_vk_interface = nullptr;
+
+// context negotiation interface (v2) so we can create the logical device with all extensions Cemu requires
+namespace
+{
+	VkApplicationInfo s_libretroAppInfo{};
+	retro_hw_render_context_negotiation_interface_vulkan s_ctxNegotiationInterface{};
+	bool s_libretro_createDevice2Called = false; // diagnostic: did the frontend call our create_device2?
+
+	const VkApplicationInfo* libretro_vk_getApplicationInfo()
+	{
+		s_libretroAppInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+		s_libretroAppInfo.pApplicationName = EMULATOR_NAME;
+		s_libretroAppInfo.applicationVersion = VK_MAKE_VERSION(EMULATOR_VERSION_MAJOR, EMULATOR_VERSION_MINOR, EMULATOR_VERSION_PATCH);
+		s_libretroAppInfo.pEngineName = EMULATOR_NAME;
+		s_libretroAppInfo.engineVersion = s_libretroAppInfo.applicationVersion;
+		s_libretroAppInfo.apiVersion = VK_API_VERSION_1_2;
+		return &s_libretroAppInfo;
+	}
+
+	bool libretro_vk_pickQueueFamily(const VkPhysicalDevice gpu, VkSurfaceKHR surface, uint32_t& outQueueFamily)
+	{
+		uint32_t queueFamilyCount = 0;
+		vkGetPhysicalDeviceQueueFamilyProperties(gpu, &queueFamilyCount, nullptr);
+		std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+		vkGetPhysicalDeviceQueueFamilyProperties(gpu, &queueFamilyCount, queueFamilies.data());
+
+		for (uint32_t i = 0; i < queueFamilies.size(); i++)
+		{
+			if (queueFamilies[i].queueCount == 0)
+				continue;
+			const VkQueueFlags required = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+			if ((queueFamilies[i].queueFlags & required) != required)
+				continue;
+			if (surface != VK_NULL_HANDLE)
+			{
+				VkBool32 presentSupport = VK_FALSE;
+				if (vkGetPhysicalDeviceSurfaceSupportKHR(gpu, i, surface, &presentSupport) != VK_SUCCESS || !presentSupport)
+					continue;
+			}
+			outQueueFamily = i;
+			return true;
+		}
+
+		// fall back to any graphics queue
+		VulkanRenderer::QueueFamilyIndices indices = VulkanRenderer::FindQueueFamilies(surface, gpu);
+		if (indices.graphicsFamily >= 0)
+		{
+			outQueueFamily = (uint32_t)indices.graphicsFamily;
+			return true;
+		}
+		return false;
+	}
+
+	bool libretro_vk_createDevice2(struct retro_vulkan_context* context, VkInstance instance, VkPhysicalDevice gpu, VkSurfaceKHR surface, PFN_vkGetInstanceProcAddr get_instance_proc_addr, retro_vulkan_create_device_wrapper_t create_device_wrapper, void* opaque)
+	{
+		s_libretro_createDevice2Called = true;
+		cemuLog_log(LogType::Force, "[Vulkan] libretro create_device2 called (gpu={} surface={})", (void*)gpu, (void*)surface);
+		// pick a physical device if the frontend left the choice to us
+		if (gpu == VK_NULL_HANDLE)
+		{
+			uint32_t device_count = 0;
+			vkEnumeratePhysicalDevices(instance, &device_count, nullptr);
+			std::vector<VkPhysicalDevice> devices(device_count);
+			vkEnumeratePhysicalDevices(instance, &device_count, devices.data());
+			for (const auto& device : devices)
+			{
+				if (VulkanRenderer::IsDeviceSuitable(surface, device))
+				{
+					gpu = device;
+					break;
+				}
+			}
+			if (gpu == VK_NULL_HANDLE)
+			{
+				cemuLog_log(LogType::Force, "[Vulkan] libretro create_device2: no suitable physical device found");
+				return false;
+			}
+		}
+
+		VulkanRenderer::FeatureControl featureControl;
+		VulkanRenderer::CheckDeviceExtensionSupport(gpu, featureControl);
+
+		uint32_t queueFamilyIndex = 0;
+		if (!libretro_vk_pickQueueFamily(gpu, surface, queueFamilyIndex))
+		{
+			cemuLog_log(LogType::Force, "[Vulkan] libretro create_device2: no suitable queue family found");
+			return false;
+		}
+
+		const float kQueuePriority = 1.0f;
+		VkDeviceQueueCreateInfo queueCreateInfo{};
+		queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+		queueCreateInfo.queueFamilyIndex = queueFamilyIndex;
+		queueCreateInfo.queueCount = 1;
+		queueCreateInfo.pQueuePriorities = &kQueuePriority;
+
+		VkPhysicalDeviceFeatures deviceFeatures = {};
+		deviceFeatures.independentBlend = VK_TRUE;
+		deviceFeatures.samplerAnisotropy = VK_TRUE;
+		deviceFeatures.imageCubeArray = VK_TRUE;
+		deviceFeatures.logicOp = VK_TRUE;
+#if !BOOST_OS_MACOS
+		deviceFeatures.geometryShader = VK_TRUE;
+#endif
+		deviceFeatures.occlusionQueryPrecise = VK_TRUE;
+		deviceFeatures.depthClamp = VK_TRUE;
+		deviceFeatures.depthBiasClamp = VK_TRUE;
+		if (featureControl.deviceExtensions.pipeline_robustness)
+			deviceFeatures.robustBufferAccess = VK_FALSE;
+		else
+			deviceFeatures.robustBufferAccess = VK_TRUE;
+		if (featureControl.mode.useTFEmulationViaSSBO)
+			deviceFeatures.vertexPipelineStoresAndAtomics = VK_TRUE;
+
+		// feature extension structs (keep alive until vkCreateDevice returns)
+		VkPhysicalDevicePipelineCreationCacheControlFeaturesEXT cacheControlFeature{};
+		VkPhysicalDeviceCustomBorderColorFeaturesEXT customBorderColorFeature{};
+		VkPhysicalDevicePresentIdFeaturesKHR presentIdFeature{};
+		VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeature{};
+		VkPhysicalDevicePipelineRobustnessFeaturesEXT pipelineRobustnessFeature{};
+		void* deviceExtensionFeatures = nullptr;
+		if (featureControl.deviceExtensions.pipeline_creation_cache_control)
+		{
+			cacheControlFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES_EXT;
+			cacheControlFeature.pNext = deviceExtensionFeatures;
+			deviceExtensionFeatures = &cacheControlFeature;
+			cacheControlFeature.pipelineCreationCacheControl = VK_TRUE;
+		}
+		if (featureControl.deviceExtensions.custom_border_color_without_format)
+		{
+			customBorderColorFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT;
+			customBorderColorFeature.pNext = deviceExtensionFeatures;
+			deviceExtensionFeatures = &customBorderColorFeature;
+			customBorderColorFeature.customBorderColors = VK_TRUE;
+			customBorderColorFeature.customBorderColorWithoutFormat = VK_TRUE;
+		}
+		if (featureControl.deviceExtensions.present_wait)
+		{
+			presentIdFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
+			presentIdFeature.pNext = deviceExtensionFeatures;
+			deviceExtensionFeatures = &presentIdFeature;
+			presentIdFeature.presentId = VK_TRUE;
+		}
+		if (featureControl.deviceExtensions.present_wait)
+		{
+			presentWaitFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
+			presentWaitFeature.pNext = deviceExtensionFeatures;
+			deviceExtensionFeatures = &presentWaitFeature;
+			presentWaitFeature.presentWait = VK_TRUE;
+		}
+		if (featureControl.deviceExtensions.pipeline_robustness)
+		{
+			pipelineRobustnessFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT;
+			pipelineRobustnessFeature.pNext = deviceExtensionFeatures;
+			deviceExtensionFeatures = &pipelineRobustnessFeature;
+			pipelineRobustnessFeature.pipelineRobustness = VK_TRUE;
+		}
+
+		std::vector<const char*> used_extensions = kRequiredDeviceExtensions;
+		if (featureControl.deviceExtensions.tooling_info)
+			used_extensions.emplace_back(VK_EXT_TOOLING_INFO_EXTENSION_NAME);
+		if (featureControl.deviceExtensions.depth_range_unrestricted)
+			used_extensions.emplace_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
+		if (featureControl.deviceExtensions.nv_fill_rectangle)
+			used_extensions.emplace_back(VK_NV_FILL_RECTANGLE_EXTENSION_NAME);
+		if (featureControl.deviceExtensions.pipeline_feedback)
+			used_extensions.emplace_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+		if (featureControl.deviceExtensions.cubic_filter)
+			used_extensions.emplace_back(VK_EXT_FILTER_CUBIC_EXTENSION_NAME);
+		if (featureControl.deviceExtensions.custom_border_color)
+			used_extensions.emplace_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+		if (featureControl.deviceExtensions.driver_properties)
+			used_extensions.emplace_back(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME);
+		if (featureControl.deviceExtensions.external_memory_host)
+			used_extensions.emplace_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+		if (featureControl.deviceExtensions.synchronization2)
+			used_extensions.emplace_back(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+		if (featureControl.deviceExtensions.dynamic_rendering)
+			used_extensions.emplace_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+		if (featureControl.deviceExtensions.shader_float_controls)
+			used_extensions.emplace_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+		if (featureControl.deviceExtensions.depth_clip_enable)
+			used_extensions.emplace_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
+		if (featureControl.deviceExtensions.present_wait)
+		{
+			used_extensions.emplace_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+			used_extensions.emplace_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+		}
+		if (featureControl.deviceExtensions.pipeline_robustness)
+			used_extensions.emplace_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+
+		VkDeviceCreateInfo createInfo{};
+		createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+		createInfo.pQueueCreateInfos = &queueCreateInfo;
+		createInfo.queueCreateInfoCount = 1;
+		createInfo.pEnabledFeatures = &deviceFeatures;
+		createInfo.enabledExtensionCount = (uint32_t)used_extensions.size();
+		createInfo.ppEnabledExtensionNames = used_extensions.data();
+		createInfo.pNext = deviceExtensionFeatures;
+
+		VkDevice device = create_device_wrapper(gpu, opaque, &createInfo);
+		if (device == VK_NULL_HANDLE)
+			return false;
+
+		VkQueue queue = VK_NULL_HANDLE;
+		vkGetDeviceQueue(device, queueFamilyIndex, 0, &queue);
+
+		cemuLog_log(LogType::Force, "[Vulkan] libretro create_device2 success: queue family {}, {} device extensions enabled", queueFamilyIndex, (uint32)used_extensions.size());
+
+		context->gpu = gpu;
+		context->device = device;
+		context->queue = queue;
+		context->queue_family_index = queueFamilyIndex;
+		context->presentation_queue = queue;
+		context->presentation_queue_family_index = queueFamilyIndex;
+		return true;
+	}
+
+	void libretro_vk_destroyDevice()
+	{
+		// device is owned by the frontend, nothing to do here
+	}
+}
+
+struct retro_hw_render_context_negotiation_interface_vulkan* VulkanRenderer::GetContextNegotiationInterface()
+{
+	s_ctxNegotiationInterface.interface_type = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN;
+	s_ctxNegotiationInterface.interface_version = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION;
+	s_ctxNegotiationInterface.get_application_info = libretro_vk_getApplicationInfo;
+	s_ctxNegotiationInterface.create_device = nullptr;
+	s_ctxNegotiationInterface.destroy_device = libretro_vk_destroyDevice;
+	s_ctxNegotiationInterface.create_instance = nullptr;
+	s_ctxNegotiationInterface.create_device2 = libretro_vk_createDevice2;
+	return &s_ctxNegotiationInterface;
+}
+
+bool VulkanRenderer::IsRetroLibretroDevice()
+{
+	return s_libretro_vk_interface != nullptr;
+}
+
+void VulkanRenderer::SetLibretroVulkanInterface(const struct retro_hw_render_interface_vulkan* iface)
+{
+	s_libretro_vk_interface = iface;
+}
+
+void VulkanRenderer::libretro_vk_initPresentation(uint32_t width, uint32_t height)
+{
+	if (width == 0 || height == 0)
+	{
+		width = 1920;
+		height = 1080;
+	}
+	cemuLog_log(LogType::Force, "[Vulkan] libretro_vk_initPresentation: {}x{}", width, height);
+
+	libretro_vk_destroyPresentation();
+
+	const VkFormat imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+	m_libretroExtent = { width, height };
+
+	uint32_t numImages = 3;
+	if (s_libretro_vk_interface && s_libretro_vk_interface->get_num_swapchain_images)
+	{
+		const uint32_t reported = s_libretro_vk_interface->get_num_swapchain_images(s_libretro_vk_interface->handle);
+		cemuLog_log(LogType::Force, "[Vulkan] get_num_swapchain_images reported {}", reported);
+		numImages = reported;
+	}
+	// clamp to a sane range: a bogus/huge value here would create hundreds of present images and
+	// exhaust VRAM (each image is width*height*4 bytes).
+	numImages = std::clamp(numImages, 2u, 8u);
+
+	// create render pass (color attachment, store to color attachment layout)
+	VkAttachmentDescription colorAttachment{};
+	colorAttachment.format = imageFormat;
+	colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+	colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	colorAttachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	VkAttachmentReference colorAttachmentRef{};
+	colorAttachmentRef.attachment = 0;
+	colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	VkSubpassDescription subpass{};
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &colorAttachmentRef;
+
+	VkSubpassDependency dependency{};
+	dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+	dependency.dstSubpass = 0;
+	dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependency.srcAccessMask = 0;
+	dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+	VkRenderPassCreateInfo renderPassInfo{};
+	renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	renderPassInfo.attachmentCount = 1;
+	renderPassInfo.pAttachments = &colorAttachment;
+	renderPassInfo.subpassCount = 1;
+	renderPassInfo.pSubpasses = &subpass;
+	renderPassInfo.dependencyCount = 1;
+	renderPassInfo.pDependencies = &dependency;
+
+	if (vkCreateRenderPass(m_logicalDevice, &renderPassInfo, nullptr, &m_libretroRenderPass) != VK_SUCCESS)
+		throw std::runtime_error("Failed to create libretro present render pass");
+
+	// create present images
+	m_libretroImages.resize(numImages);
+	m_libretroImageMemory.resize(numImages);
+	m_libretroImageViews.resize(numImages);
+	m_libretroFramebuffers.resize(numImages);
+	m_libretroImageSemaphores.resize(numImages);
+	m_libretroImagePresented.assign(numImages, 0);
+	m_libretroImageCmdBufferIndices.resize(numImages);
+
+	for (uint32_t i = 0; i < numImages; i++)
+	{
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.extent = { width, height, 1 };
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.format = imageFormat;
+		// Use OPTIMAL tiling: this image is used as a color attachment and sampled by the
+		// frontend. LINEAR tiling does not support those format features on most GPUs
+		// (NVIDIA included), yielding a corrupt or unusable image. The present images are
+		// tiny (a few RGBA frames, ~8MB each) so device-local VRAM is not a concern. This
+		// mirrors the flycast libretro renderer, which uses device-local optimal images.
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+		if (vkCreateImage(m_logicalDevice, &imageInfo, nullptr, &m_libretroImages[i]) != VK_SUCCESS)
+			throw std::runtime_error("Failed to create libretro present image");
+
+		// Allocate and bind image memory through Cemu's texture heap. It intersects the
+		// image's memoryTypeBits with the available memory types (device-local first, host
+		// fallback) and sub-allocates from large chunks. A hand-rolled vkAllocateMemory can
+		// pick a memory type that is not in the image's memoryTypeBits, which fails with
+		// VK_ERROR_OUT_OF_DEVICE_MEMORY even for tiny images on some NVIDIA drivers.
+		m_libretroImageMemory[i] = memoryManager->imageMemoryAllocate(m_libretroImages[i]);
+		if (!m_libretroImageMemory[i])
+			throw std::runtime_error("Failed to allocate libretro present image memory");
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = m_libretroImages[i];
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = imageFormat;
+		viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+		if (vkCreateImageView(m_logicalDevice, &viewInfo, nullptr, &m_libretroImageViews[i]) != VK_SUCCESS)
+			throw std::runtime_error("Failed to create libretro present image view");
+
+		VkFramebufferCreateInfo framebufferInfo{};
+		framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		framebufferInfo.renderPass = m_libretroRenderPass;
+		framebufferInfo.attachmentCount = 1;
+		framebufferInfo.pAttachments = &m_libretroImageViews[i];
+		framebufferInfo.width = width;
+		framebufferInfo.height = height;
+		framebufferInfo.layers = 1;
+		if (vkCreateFramebuffer(m_logicalDevice, &framebufferInfo, nullptr, &m_libretroFramebuffers[i]) != VK_SUCCESS)
+			throw std::runtime_error("Failed to create libretro present framebuffer");
+
+		VkSemaphoreCreateInfo semaphoreInfo{};
+		semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+		if (vkCreateSemaphore(m_logicalDevice, &semaphoreInfo, nullptr, &m_libretroImageSemaphores[i]) != VK_SUCCESS)
+			throw std::runtime_error("Failed to create libretro present semaphore");
+	}
+
+	// build present info structs (used by retro_vulkan_set_image_t)
+	m_libretroImagePresentInfo.resize(numImages);
+	for (uint32_t i = 0; i < numImages; i++)
+	{
+		VkImageViewCreateInfo presentCreateInfo{};
+		presentCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		presentCreateInfo.image = m_libretroImages[i];
+		presentCreateInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		presentCreateInfo.format = imageFormat;
+		presentCreateInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+		m_libretroImagePresentInfo[i].image_view = m_libretroImageViews[i];
+		m_libretroImagePresentInfo[i].image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		m_libretroImagePresentInfo[i].create_info = presentCreateInfo;
+	}
+
+	m_libretroNextImageIndex = 0;
+	m_libretroLastFrameImage.store(0, std::memory_order_release);
+	m_libretroPresentCounter.store(0, std::memory_order_release);
+
+	cemuLog_log(LogType::Force, "[Vulkan] libretro presentation initialized: {} images {}x{}", numImages, width, height);
+}
+
+void VulkanRenderer::libretro_vk_destroyPresentation()
+{
+	if (m_logicalDevice == VK_NULL_HANDLE)
+		return;
+	for (auto& sem : m_libretroImageSemaphores)
+	{
+		if (sem != VK_NULL_HANDLE)
+			vkDestroySemaphore(m_logicalDevice, sem, nullptr);
+	}
+	m_libretroImageSemaphores.clear();
+	for (auto& fb : m_libretroFramebuffers)
+	{
+		if (fb != VK_NULL_HANDLE)
+			vkDestroyFramebuffer(m_logicalDevice, fb, nullptr);
+	}
+	m_libretroFramebuffers.clear();
+	for (auto& view : m_libretroImageViews)
+	{
+		if (view != VK_NULL_HANDLE)
+			vkDestroyImageView(m_logicalDevice, view, nullptr);
+	}
+	m_libretroImageViews.clear();
+	for (uint32_t i = 0; i < m_libretroImageMemory.size(); i++)
+	{
+		if (m_libretroImageMemory[i])
+			memoryManager->imageMemoryFree(m_libretroImageMemory[i]);
+	}
+	m_libretroImageMemory.clear();
+	for (auto& image : m_libretroImages)
+	{
+		if (image != VK_NULL_HANDLE)
+			vkDestroyImage(m_logicalDevice, image, nullptr);
+	}
+	m_libretroImages.clear();
+	m_libretroImagePresented.clear();
+	m_libretroImageCmdBufferIndices.clear();
+	m_libretroImagePresentInfo.clear();
+	if (m_libretroRenderPass != VK_NULL_HANDLE)
+	{
+		vkDestroyRenderPass(m_logicalDevice, m_libretroRenderPass, nullptr);
+		m_libretroRenderPass = VK_NULL_HANDLE;
+	}
+	m_libretroExtent = {};
+	m_libretroNextImageIndex = 0;
+}
+
+const struct retro_vulkan_image* VulkanRenderer::libretro_vk_getLastFrameImage() const
+{
+	if (m_libretroImageViews.empty())
+		return nullptr;
+	const uint32_t imageIndex = m_libretroLastFrameImage.load(std::memory_order_acquire);
+	if (imageIndex >= m_libretroImageViews.size())
+		return nullptr;
+	return &m_libretroImagePresentInfo[imageIndex];
+}
+
+VkSemaphore VulkanRenderer::libretro_vk_getLastFrameSignalSemaphore() const
+{
+	const uint32_t imageIndex = m_libretroLastFrameImage.load(std::memory_order_acquire);
+	if (imageIndex >= m_libretroImageSemaphores.size())
+		return VK_NULL_HANDLE;
+	return m_libretroImageSemaphores[imageIndex];
+}
+
+uint32_t VulkanRenderer::libretro_vk_getPresentCounter() const
+{
+	return m_libretroPresentCounter.load(std::memory_order_acquire);
+}
+#endif
 
 VKAPI_ATTR VkBool32 VKAPI_CALL DebugUtilsCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageTypes, const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData)
 {
@@ -352,6 +828,55 @@ VulkanRenderer::VulkanRenderer()
 	if (useValidationLayer)
 		m_layerNames.emplace_back("VK_LAYER_KHRONOS_validation");
 
+#ifdef RETRO_CORE
+	if (IsRetroLibretroDevice())
+	{
+		// libretro mode: use the instance, physical device, logical device and queue provided by RetroArch
+		cemuLog_log(LogType::Force, "[Vulkan] libretro mode: using RetroArch Vulkan device");
+		m_instance = s_libretro_vk_interface->instance;
+		m_physicalDevice = s_libretro_vk_interface->gpu;
+		m_logicalDevice = s_libretro_vk_interface->device;
+		m_graphicsQueue = s_libretro_vk_interface->queue;
+		m_presentQueue = s_libretro_vk_interface->queue;
+		m_indices.graphicsFamily = (sint32)s_libretro_vk_interface->queue_index;
+		m_indices.presentFamily = (sint32)s_libretro_vk_interface->queue_index;
+
+		// CRITICAL: load our Vulkan entry points through the loaders RetroArch provides in the
+		// HW render interface, instead of our own vulkan-1.dll GetProcAddress. RetroArch may have
+		// created the instance/device behind a Vulkan layer chain (overlays such as RTSS, MSI
+		// Afterburner, Discord, GeForce Experience, Steam, RenderDoc...). Resolving functions with
+		// our own vkGetInstanceProcAddr/vkGetDeviceProcAddr bypasses that layer chain, so our
+		// dispatch does not match the device RetroArch created. That mismatch makes calls like
+		// vkAllocateMemory fail (VK_ERROR_OUT_OF_DEVICE_MEMORY) and can hang the GPU. This is what
+		// the flycast libretro renderer does (it loads all symbols via the interface's proc addrs).
+		cemuLog_log(LogType::Force, "[Vulkan] libretro diagnostics: create_device2_called={} frontend_instance_proc={} our_instance_proc={} frontend_device_proc={}",
+			s_libretro_createDevice2Called ? 1 : 0,
+			(void*)s_libretro_vk_interface->get_instance_proc_addr,
+			(void*)vkGetInstanceProcAddr,
+			(void*)s_libretro_vk_interface->get_device_proc_addr);
+		if (s_libretro_vk_interface->get_instance_proc_addr)
+			vkGetInstanceProcAddr = s_libretro_vk_interface->get_instance_proc_addr;
+		if (s_libretro_vk_interface->get_device_proc_addr)
+			vkGetDeviceProcAddr = s_libretro_vk_interface->get_device_proc_addr;
+
+		if (!InitializeInstanceVulkan(m_instance))
+			throw std::runtime_error("Unable to load instanced Vulkan functions");
+		if (!InitializeDeviceVulkan(m_logicalDevice))
+			throw std::runtime_error("Unable to load device Vulkan functions");
+
+		CheckDeviceExtensionSupport(m_physicalDevice, m_featureControl);
+		DetermineVendor();
+		GetDeviceFeatures();
+
+		// init memory manager
+		memoryManager.reset(new VKRMemoryManager(this));
+
+		cemuLog_log(LogType::Force, "[Vulkan] libretro mode: using queue family {}", (uint32)s_libretro_vk_interface->queue_index);
+	}
+	else
+	{
+#endif
+
 	// check available instance extensions
 	std::vector<const char*> enabledInstanceExtensions = CheckInstanceExtensionSupport(m_featureControl);
 
@@ -568,6 +1093,10 @@ VulkanRenderer::VulkanRenderer()
 
 	vkDestroySurfaceKHR(m_instance, surface, nullptr);
 
+#ifdef RETRO_CORE
+	}
+#endif
+
 	if (useValidationLayer && m_featureControl.instanceExtensions.debug_utils)
 	{
 		PFN_vkCreateDebugUtilsMessengerEXT vkCreateDebugUtilsMessengerEXT = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(vkGetInstanceProcAddr(m_instance, "vkCreateDebugUtilsMessengerEXT"));
@@ -658,6 +1187,9 @@ VulkanRenderer::VulkanRenderer()
 
 VulkanRenderer::~VulkanRenderer()
 {
+#ifdef RETRO_CORE
+	libretro_vk_destroyPresentation();
+#endif
 	SubmitCommandBuffer();
 	WaitDeviceIdle();
 	WaitCommandBufferFinished(GetCurrentCommandBufferId());
@@ -757,12 +1289,19 @@ VulkanRenderer::~VulkanRenderer()
 	// destroy instance, devices
 	if (m_instance != VK_NULL_HANDLE)
 	{
+#ifdef RETRO_CORE
+		if (!IsRetroLibretroDevice())
+		{
+#endif
 		if (m_logicalDevice != VK_NULL_HANDLE)
 		{
 			vkDestroyDevice(m_logicalDevice, nullptr);
 		}
 
 		vkDestroyInstance(m_instance, nullptr);
+#ifdef RETRO_CORE
+		}
+#endif
 	}
 
 	// crashes?
@@ -1966,6 +2505,10 @@ void VulkanRenderer::DeleteFontTextures()
 
 bool VulkanRenderer::BeginFrame(bool mainWindow)
 {
+#ifdef RETRO_CORE
+	if (IsRetroLibretroDevice())
+		return true; // no swapchain acquisition needed in libretro mode
+#endif
 	if (!AcquireNextSwapchainImage(mainWindow))
 		return false;
 
@@ -2094,7 +2637,20 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
 	submitInfo.pWaitDstStageMask = semWaitStageMask;
 	submitInfo.pWaitSemaphores = waitSemArray;
 
+#ifdef RETRO_CORE
+	// In libretro mode the VkQueue is owned by the frontend and shared between the Cemu
+	// Latte thread (which submits here) and RetroArch's main thread (which composites the
+	// presented image). VkQueue submission must be externally synchronized, so guard it
+	// with the frontend-provided queue lock to avoid concurrent vkQueueSubmit (crash).
+	const bool useLibretroQueueLock = IsRetroLibretroDevice() && s_libretro_vk_interface && s_libretro_vk_interface->lock_queue;
+	if (useLibretroQueueLock)
+		s_libretro_vk_interface->lock_queue(s_libretro_vk_interface->handle);
+#endif
 	const VkResult result = vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, m_cmd_buffer_fences[m_commandBufferIndex]);
+#ifdef RETRO_CORE
+	if (useLibretroQueueLock)
+		s_libretro_vk_interface->unlock_queue(s_libretro_vk_interface->handle);
+#endif
 	if (result != VK_SUCCESS)
 		UnrecoverableError(fmt::format("failed to submit command buffer. Error {}", result).c_str());
 	m_numSubmittedCmdBuffers++;
@@ -2631,7 +3187,11 @@ VkPipelineShaderStageCreateInfo VulkanRenderer::CreatePipelineShaderStageCreateI
 VkPipeline VulkanRenderer::backbufferBlit_createGraphicsPipeline(VkDescriptorSetLayout descriptorLayout, bool padView, RendererOutputShader* shader)
 {
 	auto& chainInfo = GetChainInfo(!padView);
+	return backbufferBlit_createGraphicsPipelineInternal(descriptorLayout, chainInfo.m_swapchainRenderPass, padView, shader);
+}
 
+VkPipeline VulkanRenderer::backbufferBlit_createGraphicsPipelineInternal(VkDescriptorSetLayout descriptorLayout, VkRenderPass renderPass, bool padView, RendererOutputShader* shader)
+{
 	RendererShaderVk* vertexRendererShader = static_cast<RendererShaderVk*>(shader->GetVertexShader());
 	RendererShaderVk* fragmentRendererShader = static_cast<RendererShaderVk*>(shader->GetFragmentShader());
 
@@ -2639,6 +3199,7 @@ VkPipeline VulkanRenderer::backbufferBlit_createGraphicsPipeline(VkDescriptorSet
 	hash += (uint64)vertexRendererShader;
 	hash += (uint64)fragmentRendererShader;
 	hash += ((uint64)padView) << 1;
+	hash ^= (uint64)renderPass * 0x9E3779B97F4A7C15ull;
 
 	const auto it = m_backbufferBlitPipelineCache.find(hash);
 	if (it != m_backbufferBlitPipelineCache.cend())
@@ -2734,7 +3295,7 @@ VkPipeline VulkanRenderer::backbufferBlit_createGraphicsPipeline(VkDescriptorSet
 	pipelineInfo.pMultisampleState = &multisampling;
 	pipelineInfo.pColorBlendState = &colorBlending;
 	pipelineInfo.layout = m_pipelineLayout;
-	pipelineInfo.renderPass = chainInfo.m_swapchainRenderPass;
+	pipelineInfo.renderPass = renderPass;
 	pipelineInfo.subpass = 0;
 	pipelineInfo.basePipelineHandle = VK_NULL_HANDLE;
 
@@ -3042,11 +3603,163 @@ void VulkanRenderer::ClearColorImage(LatteTextureVk* vkTexture, uint32 sliceInde
 void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutputShader* shader, bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground)
 {
 #ifdef RETRO_CORE
-	// In libretro mode, we don't have a swapchain - frames are presented via retro_video_refresh_t
-	cemuLog_log(LogType::Force, "[Vulkan] DrawBackbufferQuad called: padView={} imageSize={}x{}", padView, imageWidth, imageHeight);
-	extern std::atomic_bool s_frame_ready;
-	s_frame_ready.store(true, std::memory_order_release);
-	return;
+	if (IsRetroLibretroDevice())
+	{
+		// In libretro mode we render into our own images which are presented to RetroArch via retro_vulkan_set_image_t
+		extern std::atomic_bool s_frame_ready;
+
+		if (!s_libretro_vk_interface || m_libretroImages.empty())
+		{
+			s_frame_ready.store(true, std::memory_order_release);
+			return;
+		}
+
+		const uint32_t imageIndex = m_libretroNextImageIndex;
+		if (imageIndex >= m_libretroImages.size())
+		{
+			s_frame_ready.store(true, std::memory_order_release);
+			return;
+		}
+
+		LatteTextureViewVk* texViewVk = (LatteTextureViewVk*)texView;
+		draw_endRenderPass();
+
+		// wait for the previous submit which rendered into this image (if any) before reusing it
+		if (m_libretroImagePresented[imageIndex])
+		{
+			const uint32_t lastCmdBufferIndex = m_libretroImageCmdBufferIndices[imageIndex];
+			vkWaitForFences(m_logicalDevice, 1, &m_cmd_buffer_fences[lastCmdBufferIndex], VK_TRUE, UINT64_MAX);
+		}
+
+		// transition target image to color attachment
+		VkImageMemoryBarrier toColorAttachment{};
+		toColorAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		toColorAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		toColorAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		toColorAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		toColorAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		toColorAttachment.image = m_libretroImages[imageIndex];
+		toColorAttachment.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+		toColorAttachment.srcAccessMask = 0;
+		toColorAttachment.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toColorAttachment);
+
+		// barrier for input texture
+		VkMemoryBarrier memoryBarrier{};
+		memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+		VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+		memoryBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+		memoryBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, srcStage, dstStage, 0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
+
+		auto pipeline = backbufferBlit_createGraphicsPipelineInternal(m_swapchainDescriptorSetLayout, m_libretroRenderPass, padView, shader);
+
+		VkRenderPassBeginInfo renderPassInfo = {};
+		renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		renderPassInfo.renderPass = m_libretroRenderPass;
+		renderPassInfo.framebuffer = m_libretroFramebuffers[imageIndex];
+		renderPassInfo.renderArea.offset = { 0, 0 };
+		renderPassInfo.renderArea.extent = m_libretroExtent;
+		renderPassInfo.clearValueCount = 0;
+
+		VkViewport viewport{};
+		viewport.x = imageX;
+		viewport.y = imageY;
+		viewport.width = imageWidth;
+		viewport.height = imageHeight;
+		viewport.minDepth = 0.0f;
+		viewport.maxDepth = 1.0f;
+		vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &viewport);
+
+		VkRect2D scissor{};
+		scissor.extent = m_libretroExtent;
+		vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
+
+		auto descriptSet = backbufferBlit_createDescriptorSet(m_swapchainDescriptorSetLayout, texViewVk, useLinearTexFilter);
+
+		vkCmdBeginRenderPass(m_state.currentCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+		if (clearBackground)
+		{
+			VkClearAttachment clearAttachment{};
+			clearAttachment.clearValue = {0,0,0,0};
+			clearAttachment.colorAttachment = 0;
+			clearAttachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			VkClearRect clearExtent = {{{0,0},m_libretroExtent}, 0, 1};
+			vkCmdClearAttachments(m_state.currentCommandBuffer, 1, &clearAttachment, 1, &clearExtent);
+		}
+
+		vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		m_state.currentPipeline = pipeline;
+
+		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &descriptSet, 0, nullptr);
+
+		// update push constants
+		struct
+		{
+			Vector2f vecs[3];
+			VkBool32 applySRGBEncoding;
+			float targetGamma;
+			float displayGamma;
+		} pushData;
+
+		// textureSrcResolution
+		sint32 effectiveWidth, effectiveHeight;
+		texView->baseTexture->GetEffectiveSize(effectiveWidth, effectiveHeight, 0);
+		pushData.vecs[0] = {(float)effectiveWidth, (float)effectiveHeight};
+
+		// nativeResolution
+		pushData.vecs[1] = {
+			(float)texViewVk->baseTexture->width,
+			(float)texViewVk->baseTexture->height,
+		};
+
+		// outputResolution
+		pushData.vecs[2] = {(float)imageWidth,(float)imageHeight};
+
+		pushData.applySRGBEncoding = padView ? LatteGPUState.drcBufferUsesSRGB : LatteGPUState.tvBufferUsesSRGB;
+		pushData.targetGamma = padView ? ActiveSettings::GetDRCGamma() : ActiveSettings::GetTVGamma();
+		pushData.displayGamma = GetConfig().userDisplayGamma;
+
+		vkCmdPushConstants(m_state.currentCommandBuffer, m_pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushData), &pushData);
+
+		vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+
+		vkCmdEndRenderPass(m_state.currentCommandBuffer);
+
+		// transition target image to shader read only (RetroArch will sample it as a texture)
+		VkImageMemoryBarrier toShaderRead{};
+		toShaderRead.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		toShaderRead.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		toShaderRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		toShaderRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		toShaderRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		toShaderRead.image = m_libretroImages[imageIndex];
+		toShaderRead.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+		toShaderRead.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toShaderRead);
+
+		// Submit everything. The frontend shares our single VkQueue, so in-order submission
+		// plus the layout-transition barrier RetroArch inserts when it receives the image is
+		// enough to synchronize the blit with the frontend's sampling; no cross-submit
+		// semaphore is needed (matches the flycast libretro renderer). Passing a binary
+		// semaphore here is unsafe because the frontend may not always consume it (duplicate
+		// frames), which leaves it signaled and trips a double-signal when the image is reused.
+		const uint32_t submittedCmdBufferIndex = m_commandBufferIndex;
+		SubmitCommandBuffer();
+
+		m_libretroImageCmdBufferIndices[imageIndex] = submittedCmdBufferIndex;
+		m_libretroImagePresented[imageIndex] = 1;
+		m_libretroImagePresentInfo[imageIndex].image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		m_libretroLastFrameImage.store(imageIndex, std::memory_order_release);
+		m_libretroPresentCounter.fetch_add(1, std::memory_order_release);
+		m_libretroNextImageIndex = (imageIndex + 1) % (uint32_t)m_libretroImages.size();
+
+		s_frame_ready.store(true, std::memory_order_release);
+		return;
+	}
 #endif
 
 	if(!AcquireNextSwapchainImage(!padView))

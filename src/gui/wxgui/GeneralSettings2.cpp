@@ -23,7 +23,9 @@
 #include "audio/DirectSoundAPI.h"
 #include "audio/XAudio27API.h"
 #endif
+#ifndef RETRO_CORE
 #include "audio/CubebAPI.h"
+#endif
 
 #include "audio/IAudioInputAPI.h"
 

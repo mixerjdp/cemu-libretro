@@ -1442,12 +1442,12 @@ static retro_hw_render_callback s_hw_render = {};
 #ifdef ENABLE_VULKAN
 // Vulkan presentation resources
 static const retro_hw_render_interface_vulkan* s_vulkan_interface = nullptr;
-static std::vector<retro_vulkan_image> s_vulkan_images;
-static std::vector<VkImage> s_vulkan_image_handles;
-static std::vector<VkDeviceMemory> s_vulkan_image_memory;
-static std::vector<VkFramebuffer> s_vulkan_framebuffers;
-static uint32_t s_vulkan_num_swapchain_images = 0;
+static uint32_t s_last_present_counter = 0;
 #endif
+
+// stubs for symbols referenced by the wxgui CemuApp object which is only used in the standalone frontend
+void CemuCommonInit() {}
+void HandlePostUpdate() {}
 
 #ifdef _WIN32
 static HDC s_ra_hdc = nullptr;
@@ -2068,9 +2068,53 @@ static void RETRO_CALLCONV libretro_context_reset()
         {
 #ifdef ENABLE_VULKAN
             if (s_log_cb) s_log_cb(RETRO_LOG_INFO, "[Cemu] Creating Vulkan renderer (will be initialized on Latte thread)\n");
-            // Create VulkanRenderer with standalone Vulkan instance/device
+            // Obtain the Vulkan render interface from RetroArch (instance/device/queue)
+            s_vulkan_interface = nullptr;
+            if (!s_env_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, &s_vulkan_interface))
+                s_vulkan_interface = nullptr;
+            if (s_vulkan_interface && s_log_cb)
+                s_log_cb(RETRO_LOG_INFO, "[Cemu] Got Vulkan hw render interface v%u queue_index=%u\n",
+                    (unsigned)s_vulkan_interface->interface_version, (unsigned)s_vulkan_interface->queue_index);
+            if (!s_vulkan_interface)
+            {
+                if (s_log_cb) s_log_cb(RETRO_LOG_ERROR, "[Cemu] Failed to get Vulkan hw render interface!\n");
+            }
+            VulkanRenderer::SetLibretroVulkanInterface(s_vulkan_interface);
             g_renderer = std::make_unique<VulkanRenderer>();
             if (s_log_cb) s_log_cb(RETRO_LOG_INFO, "[Cemu] VulkanRenderer created\n");
+            // Create the images used to present frames to RetroArch (after the renderer has adopted the external device)
+            bool presentationOk = false;
+            try
+            {
+                ((VulkanRenderer*)g_renderer.get())->libretro_vk_initPresentation(s_video_width, s_video_height);
+                presentationOk = true;
+                if (s_log_cb) s_log_cb(RETRO_LOG_INFO, "[Cemu] Vulkan presentation initialized (%ux%u)\n", s_video_width, s_video_height);
+            }
+            catch (const std::exception& ex)
+            {
+                if (s_log_cb) s_log_cb(RETRO_LOG_ERROR, "[Cemu] Vulkan presentation init failed: %s\n", ex.what());
+            }
+            if (!presentationOk)
+            {
+                // FAIL-SAFE: without present images the emulated GPU (Latte thread) would still
+                // run and submit command buffers to the Vulkan device. If that device is in a bad
+                // state (which is exactly what a failed allocation indicates), those submissions
+                // can hang the GPU and freeze the whole machine. The game is only launched when
+                // s_hw_context_ready is true (see retro_run), so we tear down and return WITHOUT
+                // setting it: the core stays on a black screen instead of hanging the GPU.
+                if (s_log_cb) s_log_cb(RETRO_LOG_ERROR, "[Cemu] Aborting HW bring-up to avoid a GPU hang. Vulkan renderer disabled for this session.\n");
+                g_renderer.reset();
+                s_vulkan_interface = nullptr;
+                VulkanRenderer::SetLibretroVulkanInterface(nullptr);
+                if (s_env_cb)
+                {
+                    struct retro_message rmsg{};
+                    rmsg.msg = "Cemu: Vulkan init failed (see log). Rendering disabled to avoid a GPU hang.";
+                    rmsg.frames = 600;
+                    s_env_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &rmsg);
+                }
+                return; // leave s_hw_context_ready = false so the title is never launched
+            }
             // NOTE: Do NOT call Initialize() here - it will be called on the Latte thread
 #else
             if (s_log_cb) s_log_cb(RETRO_LOG_ERROR, "[Cemu] Vulkan selected but not compiled in!\n");
@@ -2129,33 +2173,20 @@ static void RETRO_CALLCONV libretro_context_destroy()
     s_hw_context_ready = false;
 
 #ifdef ENABLE_VULKAN
-    // Cleanup Vulkan presentation resources
-    if (s_vulkan_interface && s_vulkan_interface->device)
+    // Cleanup Vulkan presentation resources (while the device is still alive; RetroArch destroys the device after context_destroy)
+    if (g_renderer && s_graphics_api == GraphicsAPI::Vulkan)
     {
-        VkDevice device = s_vulkan_interface->device;
-        vkDeviceWaitIdle(device);
-        
-        for (uint32_t i = 0; i < s_vulkan_num_swapchain_images; i++)
+        try
         {
-            if (s_vulkan_framebuffers[i] != VK_NULL_HANDLE)
-                vkDestroyFramebuffer(device, s_vulkan_framebuffers[i], nullptr);
-            if (s_vulkan_images[i].image_view != VK_NULL_HANDLE)
-                vkDestroyImageView(device, s_vulkan_images[i].image_view, nullptr);
-            if (s_vulkan_image_memory[i] != VK_NULL_HANDLE)
-                vkFreeMemory(device, s_vulkan_image_memory[i], nullptr);
-            if (s_vulkan_image_handles[i] != VK_NULL_HANDLE)
-                vkDestroyImage(device, s_vulkan_image_handles[i], nullptr);
+            ((VulkanRenderer*)g_renderer.get())->libretro_vk_destroyPresentation();
+            g_renderer.reset();
         }
-        
-        s_vulkan_images.clear();
-        s_vulkan_image_handles.clear();
-        s_vulkan_image_memory.clear();
-        s_vulkan_framebuffers.clear();
-        s_vulkan_num_swapchain_images = 0;
-        s_vulkan_interface = nullptr;
-        
-        if (s_log_cb) s_log_cb(RETRO_LOG_INFO, "[Cemu] Vulkan presentation resources cleaned up\n");
+        catch (...)
+        {
+        }
     }
+    s_vulkan_interface = nullptr;
+    if (s_log_cb) s_log_cb(RETRO_LOG_INFO, "[Cemu] Vulkan presentation resources cleaned up\n");
 #endif
 
 #ifdef _WIN32
@@ -2175,25 +2206,67 @@ static bool libretro_init_hw_context()
 #ifdef ENABLE_VULKAN
 	if (InitializeGlobalVulkan() && g_vulkan_available)
 	{
-		// Request Vulkan context from RetroArch
-		s_hw_render.context_type = RETRO_HW_CONTEXT_VULKAN;
-		s_hw_render.version_major = VK_API_VERSION_MAJOR(VK_API_VERSION_1_2);
-		s_hw_render.version_minor = VK_API_VERSION_MINOR(VK_API_VERSION_1_2);
-		s_hw_render.context_reset = libretro_context_reset;
-		s_hw_render.context_destroy = libretro_context_destroy;
-		s_hw_render.cache_context = false;
-		s_hw_render.debug_context = false;
-
-		if (s_env_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &s_hw_render))
+		// Offer the Vulkan context negotiation interface so RetroArch creates the logical
+		// device with ALL extensions and features Cemu requires. This is MANDATORY: Cemu
+		// enables and then uses device features (geometry shaders, synchronization2, custom
+		// border color, dynamic rendering, ...) based on what the physical device supports.
+		// If the frontend creates its own minimal device without them, Cemu submits commands
+		// that use unenabled features, which hangs the GPU (and can freeze the whole machine
+		// on some drivers). So we only accept a Vulkan context if negotiation is registered.
+		//
+		// The SUPPORT query takes a retro_hw_render_context_negotiation_interface*: the
+		// frontend writes the maximum interface version it supports into interface_version
+		// (0 if it does not recognize the Vulkan interface). The previous code passed a bare
+		// unsigned and read the version from the wrong field, so it always saw 0 and never
+		// registered the interface.
+		bool negotiationRegistered = false;
 		{
-			s_graphics_api = GraphicsAPI::Vulkan;
+			struct retro_hw_render_context_negotiation_interface negotiationSupport{};
+			negotiationSupport.interface_type = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN;
+			negotiationSupport.interface_version = 0;
+			const bool supportQueryOk = s_env_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_SUPPORT, &negotiationSupport);
+			const unsigned frontendNegVersion = supportQueryOk ? negotiationSupport.interface_version : 0u;
 			if (s_log_cb)
-				s_log_cb(RETRO_LOG_INFO, "[Cemu] Vulkan context requested successfully\n");
-			return true;
+				s_log_cb(RETRO_LOG_INFO, "[Cemu] Vulkan negotiation: support_query=%s frontend_version=%u (need >=%u)\n",
+					supportQueryOk ? "yes" : "no", frontendNegVersion,
+					(unsigned)RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION);
+			if (frontendNegVersion >= RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION)
+			{
+				struct retro_hw_render_context_negotiation_interface_vulkan* negIface = VulkanRenderer::GetContextNegotiationInterface();
+				negotiationRegistered = s_env_cb(RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE, negIface);
+				if (s_log_cb)
+					s_log_cb(RETRO_LOG_INFO, "[Cemu] Vulkan negotiation interface v%u %s\n",
+						(unsigned)RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION,
+						negotiationRegistered ? "registered" : "REJECTED by frontend");
+			}
+		}
+
+		if (negotiationRegistered)
+		{
+			// Request Vulkan context from RetroArch
+			s_hw_render.context_type = RETRO_HW_CONTEXT_VULKAN;
+			s_hw_render.version_major = VK_API_VERSION_MAJOR(VK_API_VERSION_1_2);
+			s_hw_render.version_minor = VK_API_VERSION_MINOR(VK_API_VERSION_1_2);
+			s_hw_render.context_reset = libretro_context_reset;
+			s_hw_render.context_destroy = libretro_context_destroy;
+			s_hw_render.cache_context = false;
+			s_hw_render.debug_context = false;
+
+			if (s_env_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &s_hw_render))
+			{
+				s_graphics_api = GraphicsAPI::Vulkan;
+				if (s_log_cb)
+					s_log_cb(RETRO_LOG_INFO, "[Cemu] Vulkan context requested successfully\n");
+				return true;
+			}
+			else if (s_log_cb)
+			{
+				s_log_cb(RETRO_LOG_INFO, "[Cemu] Vulkan not supported by frontend, falling back to OpenGL\n");
+			}
 		}
 		else if (s_log_cb)
 		{
-			s_log_cb(RETRO_LOG_INFO, "[Cemu] Vulkan not supported by frontend, falling back to OpenGL\n");
+			s_log_cb(RETRO_LOG_ERROR, "[Cemu] Vulkan context negotiation (v2) unavailable; refusing Vulkan to avoid a device without Cemu's required extensions (GPU-hang risk). Falling back to OpenGL.\n");
 		}
 	}
 #endif
@@ -2871,19 +2944,40 @@ extern "C"
 			else
 			{
 #ifdef ENABLE_VULKAN
-				if (s_graphics_api == GraphicsAPI::Vulkan && s_vulkan_interface)
+				if (s_graphics_api == GraphicsAPI::Vulkan && s_vulkan_interface && g_renderer)
 				{
-					uint32_t sync_index = s_vulkan_interface->get_sync_index(s_vulkan_interface->handle);
-					if (sync_index < s_vulkan_images.size())
+					VulkanRenderer* vkRenderer = (VulkanRenderer*)g_renderer.get();
+					const retro_vulkan_image* image = vkRenderer->libretro_vk_getLastFrameImage();
+					if (image)
 					{
-						s_vulkan_interface->set_image(s_vulkan_interface->handle, 
-							&s_vulkan_images[sync_index], 
-							0, nullptr, 
-							VK_QUEUE_FAMILY_IGNORED);
+						const uint32_t presentCounter = vkRenderer->libretro_vk_getPresentCounter();
+						if (presentCounter != s_last_present_counter)
+						{
+							// A new frame was blitted. RetroArch's layout-transition barrier on the received
+							// image synchronizes it against our blit in submission order (single shared VkQueue).
+							s_vulkan_interface->set_image(s_vulkan_interface->handle,
+								image,
+								0, nullptr,
+								VK_QUEUE_FAMILY_IGNORED);
+							s_last_present_counter = presentCounter;
+						}
+						else
+						{
+							// frame ready was set without a new blit (e.g. empty frame): re-present the last image
+							s_vulkan_interface->set_image(s_vulkan_interface->handle,
+								image,
+								0, nullptr,
+								VK_QUEUE_FAMILY_IGNORED);
+						}
+						s_video_cb(RETRO_HW_FRAME_BUFFER_VALID, s_video_width, s_video_height, 0);
+					}
+					else
+					{
+						// presentation was not initialized: don't signal a HW frame, avoid crashing the frontend
+						s_video_cb(nullptr, s_video_width, s_video_height, 0);
 					}
 				}
 #endif
-				s_video_cb(RETRO_HW_FRAME_BUFFER_VALID, s_video_width, s_video_height, 0);
 			}
 		}
 		else if (s_video_cb && !s_framebuffer.empty())

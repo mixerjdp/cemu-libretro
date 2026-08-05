@@ -192,6 +192,7 @@ endif()
 
 if (ENABLE_VULKAN)
 	include_directories("dependencies/Vulkan-Headers/include")
+	add_compile_definitions(ENABLE_VULKAN)
 endif()
 
 if (ENABLE_OPENGL)

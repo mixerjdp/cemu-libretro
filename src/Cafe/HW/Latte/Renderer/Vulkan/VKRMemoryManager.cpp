@@ -275,6 +275,7 @@ uint32 VkTextureChunkedHeap::allocateNewChunk(uint32 chunkIndex, uint32 minimumA
 	};
 	hostLocalMemoryTypeIndices.erase(std::remove_if(hostLocalMemoryTypeIndices.begin(), hostLocalMemoryTypeIndices.end(), pred), hostLocalMemoryTypeIndices.end());
 	// allocate chunk memory
+	VkResult lastAllocResult = VK_ERROR_INITIALIZATION_FAILED;
 	for (sint32 t = 0; t < 3; t++)
 	{
 		// attempt to allocate from device local memory first
@@ -288,7 +289,10 @@ uint32 VkTextureChunkedHeap::allocateNewChunk(uint32 chunkIndex, uint32 minimumA
 			VkDeviceMemory imageMemory;
 			VkResult r = vkAllocateMemory(VulkanRenderer::GetInstance()->GetLogicalDevice(), &allocInfo, nullptr, &imageMemory);
 			if (r != VK_SUCCESS)
+			{
+				lastAllocResult = r;
 				continue;
+			}
 			m_list_chunkInfo[chunkIndex].mem = imageMemory;
 			return allocationSize;
 		}
@@ -303,7 +307,10 @@ uint32 VkTextureChunkedHeap::allocateNewChunk(uint32 chunkIndex, uint32 minimumA
 			VkDeviceMemory imageMemory;
 			VkResult r = vkAllocateMemory(VulkanRenderer::GetInstance()->GetLogicalDevice(), &allocInfo, nullptr, &imageMemory);
 			if (r != VK_SUCCESS)
+			{
+				lastAllocResult = r;
 				continue;
+			}
 			m_list_chunkInfo[chunkIndex].mem = imageMemory;
 			return allocationSize;
 		}
@@ -313,7 +320,8 @@ uint32 VkTextureChunkedHeap::allocateNewChunk(uint32 chunkIndex, uint32 minimumA
 			break;
 		cemuLog_log(LogType::Force, "Failed to allocate texture memory chunk with size {}MB. Trying again with smaller allocation size", allocationSize / 1024 / 1024);
 	}
-	cemuLog_log(LogType::Force, "Unable to allocate image memory chunk ({} heaps)", deviceLocalMemoryTypeIndices.size());
+	cemuLog_log(LogType::Force, "Unable to allocate image memory chunk (typeFilter=0x{:08x} deviceLocalTypes={} hostLocalTypes={} lastVkResult={})",
+		m_typeFilter, deviceLocalMemoryTypeIndices.size(), hostLocalMemoryTypeIndices.size(), (sint32)lastAllocResult);
 	throw std::runtime_error("failed to allocate image memory!");
 	return 0;
 }

@@ -13,6 +13,10 @@
 #include "util/containers/flat_hash_map.hpp"
 #include "util/containers/robin_hood.h"
 
+#ifdef RETRO_CORE
+#include "libretro/libretro_vulkan.h"
+#endif
+
 struct VkSupportedFormatInfo_t
 {
 	bool fmt_d24_unorm_s8_uint{};
@@ -125,6 +129,10 @@ namespace WindowSystem
 	struct WindowHandleInfo;
 };
 
+struct retro_hw_render_interface_vulkan;
+struct retro_hw_render_context_negotiation_interface_vulkan;
+struct retro_vulkan_image;
+
 class VulkanRenderer : public Renderer
 {
 	friend class LatteQueryObjectVk;
@@ -180,6 +188,19 @@ public:
 	RendererAPI GetType() override { return RendererAPI::Vulkan; }
 
 	static VulkanRenderer* GetInstance();
+
+#ifdef RETRO_CORE
+	// libretro (RetroArch) integration
+	static bool IsRetroLibretroDevice();
+	static void SetLibretroVulkanInterface(const struct retro_hw_render_interface_vulkan* iface);
+	static struct retro_hw_render_context_negotiation_interface_vulkan* GetContextNegotiationInterface();
+	// libretro presentation
+	void libretro_vk_initPresentation(uint32_t width, uint32_t height);
+	void libretro_vk_destroyPresentation();
+	const struct retro_vulkan_image* libretro_vk_getLastFrameImage() const;
+	VkSemaphore libretro_vk_getLastFrameSignalSemaphore() const;
+	uint32_t libretro_vk_getPresentCounter() const;
+#endif
 
 	void UnrecoverableError(const char* errMsg) const;
 
@@ -434,8 +455,7 @@ private:
 	};
 	static QueueFamilyIndices FindQueueFamilies(VkSurfaceKHR surface, VkPhysicalDevice device);
 
-  private:
-
+  public:
 	struct FeatureControl
 	{
 		struct
@@ -485,9 +505,15 @@ private:
 		bool usingTracingTool{ false }; // frame debugger or other API replaying tool is used
 		bool disableMultithreadedCompilation{ false }; // for old nvidia drivers
 
-	}m_featureControl{};
+	};
+
+  public:
 	static bool CheckDeviceExtensionSupport(const VkPhysicalDevice device, FeatureControl& info);
 	static std::vector<const char*> CheckInstanceExtensionSupport(FeatureControl& info);
+	static bool IsDeviceSuitable(VkSurfaceKHR surface, const VkPhysicalDevice& device);
+
+  private:
+	FeatureControl m_featureControl{};
 
 	bool UpdateSwapchainProperties(bool mainWindow);
 	void SwapBuffer(bool mainWindow);
@@ -500,7 +526,6 @@ private:
 
 	std::vector<VkDeviceQueueCreateInfo> CreateQueueCreateInfos(const std::set<int>& uniqueQueueFamilies) const;
 	VkDeviceCreateInfo CreateDeviceCreateInfo(const std::vector<VkDeviceQueueCreateInfo>& queueCreateInfos, const VkPhysicalDeviceFeatures& deviceFeatures, const void* deviceExtensionStructs, std::vector<const char*>& used_extensions) const;
-	static bool IsDeviceSuitable(VkSurfaceKHR surface, const VkPhysicalDevice& device);
 
 	void CreateCommandPool();
 	void CreateCommandBuffers();
@@ -560,6 +585,7 @@ private:
 	void CreatePipelineCache();
 	VkPipelineShaderStageCreateInfo CreatePipelineShaderStageCreateInfo(VkShaderStageFlagBits stage, VkShaderModule& module, const char* entryName) const;
 	VkPipeline backbufferBlit_createGraphicsPipeline(VkDescriptorSetLayout descriptorLayout, bool padView, RendererOutputShader* shader);
+	VkPipeline backbufferBlit_createGraphicsPipelineInternal(VkDescriptorSetLayout descriptorLayout, VkRenderPass renderPass, bool padView, RendererOutputShader* shader);
 	bool AcquireNextSwapchainImage(bool mainWindow);
 	void RecreateSwapchain(bool mainWindow, bool skipCreate = false);
 
@@ -954,5 +980,21 @@ private:
 		RendererShaderVk* copySurface_psColor2Depth{};
 	}defaultShaders;
 
+#ifdef RETRO_CORE
+	// libretro presentation resources (RetroArch)
+	static const struct retro_hw_render_interface_vulkan* s_libretro_vk_interface;
+	VkRenderPass m_libretroRenderPass = VK_NULL_HANDLE;	std::vector<VkImage> m_libretroImages;
+	std::vector<VkImageMemAllocation*> m_libretroImageMemory;
+	std::vector<VkImageView> m_libretroImageViews;
+	std::vector<VkFramebuffer> m_libretroFramebuffers;
+	std::vector<VkSemaphore> m_libretroImageSemaphores;
+	std::vector<char> m_libretroImagePresented;
+	std::vector<uint32> m_libretroImageCmdBufferIndices;
+	std::vector<struct retro_vulkan_image> m_libretroImagePresentInfo;
+	VkExtent2D m_libretroExtent{};
+	uint32_t m_libretroNextImageIndex = 0;
+	std::atomic<uint32_t> m_libretroLastFrameImage{ 0 };
+	std::atomic<uint32_t> m_libretroPresentCounter{ 0 };
+#endif
 
 };
